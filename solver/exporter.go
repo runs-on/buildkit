@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
+	bklog "github.com/moby/buildkit/util/bklog"
 	digest "github.com/opencontainers/go-digest"
 )
 
@@ -94,11 +96,42 @@ func addBacklinks(t CacheExporterTarget, cm *cacheManager, id string, bkm map[st
 type contextT string
 
 var (
-	backlinkKey = contextT("solver/exporter/backlinks")
-	resKey      = contextT("solver/exporter/res")
+	backlinkKey        = contextT("solver/exporter/backlinks")
+	resKey             = contextT("solver/exporter/res")
+	exportPrepStatsKey = contextT("solver/exporter/preparation-stats")
 )
 
+type cacheExportPreparationStats struct {
+	startedAt           time.Time
+	exportCalls         int
+	loadRemotesCalls    int
+	loadRemotesDuration time.Duration
+	localLoadCalls      int
+	localLoadDuration   time.Duration
+	resolveRemoteCalls  int
+	resolveDuration     time.Duration
+}
+
 func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt CacheExportOpt) ([]CacheExporterRecord, error) {
+	stats, ok := ctx.Value(exportPrepStatsKey).(*cacheExportPreparationStats)
+	if !ok {
+		stats = &cacheExportPreparationStats{startedAt: time.Now()}
+		ctx = context.WithValue(ctx, exportPrepStatsKey, stats)
+		defer func() {
+			bklog.G(ctx).WithFields(map[string]any{
+				"export_calls":             stats.exportCalls,
+				"load_remotes_calls":       stats.loadRemotesCalls,
+				"load_remotes_duration_ms": stats.loadRemotesDuration.Milliseconds(),
+				"local_load_calls":         stats.localLoadCalls,
+				"local_load_duration_ms":   stats.localLoadDuration.Milliseconds(),
+				"resolve_remote_calls":     stats.resolveRemoteCalls,
+				"resolve_duration_ms":      stats.resolveDuration.Milliseconds(),
+				"total_duration_ms":        time.Since(stats.startedAt).Milliseconds(),
+			}).Info("cache export preparation summary")
+		}()
+	}
+	stats.exportCalls++
+
 	var bkm map[string][]CacheExporterRecord
 
 	if bk := ctx.Value(backlinkKey); bk == nil {
@@ -169,7 +202,10 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 			return nil, err
 		}
 
+		loadRemotesStarted := time.Now()
 		remotes, err := cm.results.LoadRemotes(ctx, res, opt.CompressionOpt, opt.Session)
+		stats.loadRemotesCalls++
+		stats.loadRemotesDuration += time.Since(loadRemotesStarted)
 		if err != nil {
 			return nil, err
 		}
@@ -188,14 +224,20 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 		}
 
 		if (remote == nil || opt.CompressionOpt != nil) && opt.Mode != CacheExportModeRemoteOnly {
+			localLoadStarted := time.Now()
 			res, err := cm.results.Load(ctx, res)
+			stats.localLoadCalls++
+			stats.localLoadDuration += time.Since(localLoadStarted)
 			if err != nil {
 				if !errors.Is(err, cerrdefs.ErrNotFound) {
 					return nil, err
 				}
 				remote = nil
 			} else {
+				resolveStarted := time.Now()
 				remotes, err := opt.ResolveRemotes(ctx, res)
+				stats.resolveRemoteCalls++
+				stats.resolveDuration += time.Since(resolveStarted)
 				if err != nil {
 					return nil, err
 				}
