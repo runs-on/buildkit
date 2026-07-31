@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 
@@ -152,6 +153,10 @@ func marshalRemote(ctx context.Context, r *solver.Remote, state *marshalState) s
 		parentID = marshalRemote(ctx, r2, state)
 	}
 	desc := r.Descriptors[len(r.Descriptors)-1]
+	if _, ok := desc.Annotations["containerd.io/distribution.source.ref"]; ok {
+		desc.Annotations = maps.Clone(desc.Annotations)
+		delete(desc.Annotations, "containerd.io/distribution.source.ref")
+	}
 
 	state.descriptors[desc.Digest] = DescriptorProviderPair{
 		Descriptor: desc,

@@ -6,6 +6,7 @@ import (
 	"slices"
 
 	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/buildkit/util/compression"
 	digest "github.com/opencontainers/go-digest"
 )
 
@@ -187,7 +188,11 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 			}
 		}
 
-		if (remote == nil || opt.CompressionOpt != nil) && opt.Mode != CacheExportModeRemoteOnly {
+		needsLocalResult := remote == nil
+		if remote != nil && opt.CompressionOpt != nil && !remoteMatchesCompression(remote, *opt.CompressionOpt) {
+			needsLocalResult = true
+		}
+		if needsLocalResult && opt.Mode != CacheExportModeRemoteOnly {
 			res, err := cm.results.Load(ctx, res)
 			if err != nil {
 				if !errors.Is(err, cerrdefs.ErrNotFound) {
@@ -310,6 +315,18 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 		res[e] = append(res[e], out)
 	}
 	return res[e], nil
+}
+
+func remoteMatchesCompression(remote *Remote, compressionOpt compression.Config) bool {
+	if remote == nil || len(remote.Descriptors) == 0 {
+		return false
+	}
+	for _, desc := range remote.Descriptors {
+		if !compression.IsMediaType(compressionOpt.Type, desc.MediaType) {
+			return false
+		}
+	}
+	return true
 }
 
 func getBestResult(records []*CacheRecord) *CacheRecord {
