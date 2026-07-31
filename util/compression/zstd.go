@@ -12,7 +12,7 @@ import (
 
 func (c zstdType) Compress(ctx context.Context, comp Config) (compressorFunc Compressor, finalize Finalizer) {
 	return func(dest io.Writer, _ string) (io.WriteCloser, error) {
-		var opts []zstd.EOption
+		opts := []zstd.EOption{zstd.WithEncoderConcurrency(2)}
 		if comp.Level != nil {
 			opts = append(opts, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(*comp.Level)))
 		}
