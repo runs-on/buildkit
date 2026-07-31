@@ -31,6 +31,7 @@ import (
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
 var g flightcontrol.Group[*leaseutil.LeaseRef]
@@ -68,28 +69,33 @@ func (sr *immutableRef) computeBlobChain(ctx context.Context, createIfNeeded boo
 	// refs rather than every single layer present among their ancestors.
 	filter := sr.layerSet()
 
-	return computeBlobChain(ctx, sr, createIfNeeded, comp, s, filter)
+	var limiter *semaphore.Weighted
+	if comp.Type == compression.Zstd {
+		limiter = semaphore.NewWeighted(2)
+	}
+
+	return computeBlobChain(ctx, sr, createIfNeeded, comp, s, filter, limiter)
 }
 
-func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool, comp compression.Config, s session.Group, filter map[string]struct{}) error {
+func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool, comp compression.Config, s session.Group, filter map[string]struct{}, limiter *semaphore.Weighted) error {
 	eg, ctx := errgroup.WithContext(ctx)
 	switch sr.kind() {
 	case Merge:
 		for _, parent := range sr.mergeParents {
 			eg.Go(func() error {
-				return computeBlobChain(ctx, parent, createIfNeeded, comp, s, filter)
+				return computeBlobChain(ctx, parent, createIfNeeded, comp, s, filter, limiter)
 			})
 		}
 	case Diff:
 		if _, ok := filter[sr.ID()]; !ok && sr.diffParents.upper != nil {
 			// This diff is just re-using the upper blob, compute that
 			eg.Go(func() error {
-				return computeBlobChain(ctx, sr.diffParents.upper, createIfNeeded, comp, s, filter)
+				return computeBlobChain(ctx, sr.diffParents.upper, createIfNeeded, comp, s, filter, limiter)
 			})
 		}
 	case Layer:
 		eg.Go(func() error {
-			return computeBlobChain(ctx, sr.layerParent, createIfNeeded, comp, s, filter)
+			return computeBlobChain(ctx, sr.layerParent, createIfNeeded, comp, s, filter, limiter)
 		})
 	}
 
@@ -101,6 +107,12 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 				}
 				if !createIfNeeded {
 					return nil, errors.WithStack(ErrNoBlobs)
+				}
+				if limiter != nil {
+					if err := limiter.Acquire(ctx, 1); err != nil {
+						return nil, err
+					}
+					defer limiter.Release(1)
 				}
 
 				l, ctx, err := leaseutil.NewLease(ctx, sr.cm.LeaseManager, leaseutil.MakeTemporary)
