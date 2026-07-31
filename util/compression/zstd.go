@@ -56,7 +56,10 @@ func zstdWriter(comp Config) func(io.Writer) (io.WriteCloser, error) {
 		if comp.Level != nil {
 			level = toZstdEncoderLevel(*comp.Level)
 		}
-		return zstd.NewWriter(dest, zstd.WithEncoderLevel(level))
+		return zstd.NewWriter(dest,
+			zstd.WithEncoderLevel(level),
+			zstd.WithEncoderConcurrency(2),
+		)
 	}
 }
 
