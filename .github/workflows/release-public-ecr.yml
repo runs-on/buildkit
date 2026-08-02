@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: runs-on=${{ github.run_id }}-${{ inputs.tag || github.ref_name }}/runner=4cpu-linux-x64/extras=s3-cache/env=bootstrap
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write

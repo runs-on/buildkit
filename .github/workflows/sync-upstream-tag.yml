@@ -10,7 +10,7 @@ on:
 
 jobs:
   patch:
-    runs-on: runs-on=${{ github.run_id }}-${{ inputs.upstream-tag }}/runner=1cpu-linux-x64/env=bootstrap
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     outputs:
