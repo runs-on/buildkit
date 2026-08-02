@@ -1,0 +1,106 @@
+From 30fdfa7c428880b9f1a4f5d3d017bed029a176d8 Mon Sep 17 00:00:00 2001
+From: Cyril Rohr <hey@cyrilrohr.com>
+Date: Fri, 31 Jul 2026 23:45:52 +0200
+Subject: [PATCH 5/5] Prepare zstd cache blobs during solve
+
+---
+ worker/cacheresult.go |  1 +
+ worker/eagercache.go  | 77 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 78 insertions(+)
+ create mode 100644 worker/eagercache.go
+
+diff --git a/worker/cacheresult.go b/worker/cacheresult.go
+index 50f7c9368..ad80b72d9 100644
+--- a/worker/cacheresult.go
++++ b/worker/cacheresult.go
+@@ -33,6 +33,7 @@ func (s *cacheResultStorage) Save(res solver.Result, createdAt time.Time) (solve
+ 				return solver.CacheResult{}, err
+ 			}
+ 		}
++		enqueueEagerZstdPreparation(ref)
+ 	}
+ 	return solver.CacheResult{ID: ref.ID(), CreatedAt: createdAt}, nil
+ }
+diff --git a/worker/eagercache.go b/worker/eagercache.go
+new file mode 100644
+index 000000000..34ecfba7f
+--- /dev/null
++++ b/worker/eagercache.go
+@@ -0,0 +1,77 @@
++package worker
++
++import (
++	"context"
++	"os"
++	"sync"
++	"time"
++
++	cacheconfig "github.com/moby/buildkit/cache/config"
++	"github.com/moby/buildkit/util/bklog"
++	"github.com/moby/buildkit/util/compression"
++)
++
++const (
++	eagerZstdCacheEnv       = "BUILDKIT_EAGER_ZSTD_CACHE_EXPORT"
++	eagerZstdQueueSize      = 32
++	eagerZstdWorkerCount    = 2
++	eagerZstdPrepareTimeout = 10 * time.Minute
++)
++
++type eagerZstdRequest struct {
++	id  string
++	ref *WorkerRef
++}
++
++var (
++	eagerZstdOnce    sync.Once
++	eagerZstdQueue   chan eagerZstdRequest
++	eagerZstdPending sync.Map
++)
++
++func enqueueEagerZstdPreparation(ref *WorkerRef) {
++	if os.Getenv(eagerZstdCacheEnv) != "1" || ref.ImmutableRef == nil {
++		return
++	}
++
++	id := ref.ID()
++	if _, loaded := eagerZstdPending.LoadOrStore(id, struct{}{}); loaded {
++		return
++	}
++
++	eagerZstdOnce.Do(func() {
++		eagerZstdQueue = make(chan eagerZstdRequest, eagerZstdQueueSize)
++		for range eagerZstdWorkerCount {
++			go eagerZstdWorker()
++		}
++	})
++
++	eagerRef := &WorkerRef{ImmutableRef: ref.ImmutableRef.Clone(), Worker: ref.Worker}
++	select {
++	case eagerZstdQueue <- eagerZstdRequest{id: id, ref: eagerRef}:
++	default:
++		eagerZstdPending.Delete(id)
++		_ = eagerRef.Release(context.Background())
++	}
++}
++
++func eagerZstdWorker() {
++	for req := range eagerZstdQueue {
++		prepareEagerZstd(req)
++	}
++}
++
++func prepareEagerZstd(req eagerZstdRequest) {
++	defer eagerZstdPending.Delete(req.id)
++	defer req.ref.Release(context.Background())
++
++	ctx, cancel := context.WithTimeout(context.Background(), eagerZstdPrepareTimeout)
++	defer cancel()
++
++	refCfg := cacheconfig.RefConfig{
++		Compression: compression.New(compression.Zstd).SetLevel(1),
++	}
++	if _, err := req.ref.GetRemotes(ctx, true, refCfg, false, nil); err != nil {
++		bklog.G(ctx).WithError(err).Debug("failed to eagerly prepare zstd cache blob")
++	}
++}

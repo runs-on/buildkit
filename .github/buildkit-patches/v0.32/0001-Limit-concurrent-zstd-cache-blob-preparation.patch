@@ -1,0 +1,84 @@
+From 72c60042fbdbfa65539b79970e582ff3ec31821a Mon Sep 17 00:00:00 2001
+From: Cyril Rohr <hey@cyrilrohr.com>
+Date: Fri, 31 Jul 2026 23:01:05 +0200
+Subject: [PATCH 1/5] Limit concurrent zstd cache blob preparation
+
+---
+ cache/blobs.go | 26 +++++++++++++++++++++-----
+ 1 file changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/cache/blobs.go b/cache/blobs.go
+index 3acc23c00..13fa625ed 100644
+--- a/cache/blobs.go
++++ b/cache/blobs.go
+@@ -31,6 +31,7 @@ import (
+ 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
+ 	"github.com/pkg/errors"
+ 	"golang.org/x/sync/errgroup"
++	"golang.org/x/sync/semaphore"
+ )
+ 
+ var g flightcontrol.Group[*leaseutil.LeaseRef]
+@@ -38,6 +39,8 @@ var gFileList flightcontrol.Group[[]string]
+ 
+ var ErrNoBlobs = errors.Errorf("no blobs for snapshot")
+ 
++const zstdBlobPreparationConcurrency int64 = 2
++
+ // computeBlobChain ensures every ref in a parent chain has an associated blob in the content store. If
+ // a blob is missing and createIfNeeded is true, then the blob will be created, otherwise ErrNoBlobs will
+ // be returned. Caller must hold a lease when calling this function.
+@@ -68,28 +71,35 @@ func (sr *immutableRef) computeBlobChain(ctx context.Context, createIfNeeded boo
+ 	// refs rather than every single layer present among their ancestors.
+ 	filter := sr.layerSet()
+ 
+-	return computeBlobChain(ctx, sr, createIfNeeded, comp, s, filter)
++	var limiter *semaphore.Weighted
++	if comp.Type == compression.Zstd {
++		// A zstd writer already uses multiple workers. Limit simultaneous snapshot
++		// walks so cache export does not oversubscribe CPU and storage bandwidth.
++		limiter = semaphore.NewWeighted(zstdBlobPreparationConcurrency)
++	}
++
++	return computeBlobChain(ctx, sr, createIfNeeded, comp, s, filter, limiter)
+ }
+ 
+-func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool, comp compression.Config, s session.Group, filter map[string]struct{}) error {
++func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool, comp compression.Config, s session.Group, filter map[string]struct{}, limiter *semaphore.Weighted) error {
+ 	eg, ctx := errgroup.WithContext(ctx)
+ 	switch sr.kind() {
+ 	case Merge:
+ 		for _, parent := range sr.mergeParents {
+ 			eg.Go(func() error {
+-				return computeBlobChain(ctx, parent, createIfNeeded, comp, s, filter)
++				return computeBlobChain(ctx, parent, createIfNeeded, comp, s, filter, limiter)
+ 			})
+ 		}
+ 	case Diff:
+ 		if _, ok := filter[sr.ID()]; !ok && sr.diffParents.upper != nil {
+ 			// This diff is just re-using the upper blob, compute that
+ 			eg.Go(func() error {
+-				return computeBlobChain(ctx, sr.diffParents.upper, createIfNeeded, comp, s, filter)
++				return computeBlobChain(ctx, sr.diffParents.upper, createIfNeeded, comp, s, filter, limiter)
+ 			})
+ 		}
+ 	case Layer:
+ 		eg.Go(func() error {
+-			return computeBlobChain(ctx, sr.layerParent, createIfNeeded, comp, s, filter)
++			return computeBlobChain(ctx, sr.layerParent, createIfNeeded, comp, s, filter, limiter)
+ 		})
+ 	}
+ 
+@@ -102,6 +112,12 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
+ 				if !createIfNeeded {
+ 					return nil, errors.WithStack(ErrNoBlobs)
+ 				}
++				if limiter != nil {
++					if err := limiter.Acquire(ctx, 1); err != nil {
++						return nil, err
++					}
++					defer limiter.Release(1)
++				}
+ 
+ 				l, ctx, err := leaseutil.NewLease(ctx, sr.cm.LeaseManager, leaseutil.MakeTemporary)
+ 				if err != nil {

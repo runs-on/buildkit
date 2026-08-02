@@ -1,0 +1,81 @@
+From 1b86c7ec305ad57b8f79b96ebb13d43a6d727c2a Mon Sep 17 00:00:00 2001
+From: Cyril Rohr <hey@cyrilrohr.com>
+Date: Fri, 31 Jul 2026 23:24:57 +0200
+Subject: [PATCH 3/5] Share zstd cache blob limiter across exports
+
+---
+ cache/blobs.go | 28 +++++++++++++---------------
+ 1 file changed, 13 insertions(+), 15 deletions(-)
+
+diff --git a/cache/blobs.go b/cache/blobs.go
+index 13fa625ed..aff653cb7 100644
+--- a/cache/blobs.go
++++ b/cache/blobs.go
+@@ -41,6 +41,8 @@ var ErrNoBlobs = errors.Errorf("no blobs for snapshot")
+ 
+ const zstdBlobPreparationConcurrency int64 = 2
+ 
++var zstdBlobPreparationLimiter = semaphore.NewWeighted(zstdBlobPreparationConcurrency)
++
+ // computeBlobChain ensures every ref in a parent chain has an associated blob in the content store. If
+ // a blob is missing and createIfNeeded is true, then the blob will be created, otherwise ErrNoBlobs will
+ // be returned. Caller must hold a lease when calling this function.
+@@ -71,35 +73,28 @@ func (sr *immutableRef) computeBlobChain(ctx context.Context, createIfNeeded boo
+ 	// refs rather than every single layer present among their ancestors.
+ 	filter := sr.layerSet()
+ 
+-	var limiter *semaphore.Weighted
+-	if comp.Type == compression.Zstd {
+-		// A zstd writer already uses multiple workers. Limit simultaneous snapshot
+-		// walks so cache export does not oversubscribe CPU and storage bandwidth.
+-		limiter = semaphore.NewWeighted(zstdBlobPreparationConcurrency)
+-	}
+-
+-	return computeBlobChain(ctx, sr, createIfNeeded, comp, s, filter, limiter)
++	return computeBlobChain(ctx, sr, createIfNeeded, comp, s, filter)
+ }
+ 
+-func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool, comp compression.Config, s session.Group, filter map[string]struct{}, limiter *semaphore.Weighted) error {
++func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool, comp compression.Config, s session.Group, filter map[string]struct{}) error {
+ 	eg, ctx := errgroup.WithContext(ctx)
+ 	switch sr.kind() {
+ 	case Merge:
+ 		for _, parent := range sr.mergeParents {
+ 			eg.Go(func() error {
+-				return computeBlobChain(ctx, parent, createIfNeeded, comp, s, filter, limiter)
++				return computeBlobChain(ctx, parent, createIfNeeded, comp, s, filter)
+ 			})
+ 		}
+ 	case Diff:
+ 		if _, ok := filter[sr.ID()]; !ok && sr.diffParents.upper != nil {
+ 			// This diff is just re-using the upper blob, compute that
+ 			eg.Go(func() error {
+-				return computeBlobChain(ctx, sr.diffParents.upper, createIfNeeded, comp, s, filter, limiter)
++				return computeBlobChain(ctx, sr.diffParents.upper, createIfNeeded, comp, s, filter)
+ 			})
+ 		}
+ 	case Layer:
+ 		eg.Go(func() error {
+-			return computeBlobChain(ctx, sr.layerParent, createIfNeeded, comp, s, filter, limiter)
++			return computeBlobChain(ctx, sr.layerParent, createIfNeeded, comp, s, filter)
+ 		})
+ 	}
+ 
+@@ -112,11 +107,14 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
+ 				if !createIfNeeded {
+ 					return nil, errors.WithStack(ErrNoBlobs)
+ 				}
+-				if limiter != nil {
+-					if err := limiter.Acquire(ctx, 1); err != nil {
++				if comp.Type == compression.Zstd {
++					// A zstd writer already uses multiple workers. Limit simultaneous
++					// snapshot walks across all exporter records so cache export does not
++					// oversubscribe CPU and storage bandwidth.
++					if err := zstdBlobPreparationLimiter.Acquire(ctx, 1); err != nil {
+ 						return nil, err
+ 					}
+-					defer limiter.Release(1)
++					defer zstdBlobPreparationLimiter.Release(1)
+ 				}
+ 
+ 				l, ctx, err := leaseutil.NewLease(ctx, sr.cm.LeaseManager, leaseutil.MakeTemporary)

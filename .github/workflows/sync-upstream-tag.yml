@@ -1,0 +1,79 @@
+name: Apply RunsOn patch to upstream tag
+
+on:
+  workflow_call:
+    inputs:
+      upstream-tag:
+        description: Upstream moby/buildkit tag to patch
+        required: true
+        type: string
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      runs-on-tag: ${{ steps.patch.outputs.runs-on-tag }}
+    steps:
+      - name: Checkout RunsOn BuildKit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Apply patch series and create tag
+        id: patch
+        env:
+          UPSTREAM_TAG: ${{ inputs.upstream-tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${UPSTREAM_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid upstream release tag: ${UPSTREAM_TAG}" >&2
+            exit 1
+          fi
+
+          version_line="$(sed -E 's/^(v[0-9]+\.[0-9]+)\..*$/\1/' <<<"${UPSTREAM_TAG}")"
+          patch_dir="${GITHUB_WORKSPACE}/.github/buildkit-patches/${version_line}"
+          if ! compgen -G "${patch_dir}/*.patch" >/dev/null; then
+            echo "No RunsOn patch set exists for ${version_line}" >&2
+            exit 1
+          fi
+
+          runs_on_tag="${UPSTREAM_TAG}-runs-on.1"
+          git fetch --force --tags origin
+          if git show-ref --verify --quiet "refs/tags/${runs_on_tag}"; then
+            echo "${runs_on_tag} already exists"
+            echo "runs-on-tag=${runs_on_tag}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          git remote add upstream https://github.com/moby/buildkit.git
+          git fetch --force --no-tags upstream \
+            "refs/tags/${UPSTREAM_TAG}:refs/upstream-tags/${UPSTREAM_TAG}"
+
+          patched_worktree="${RUNNER_TEMP}/buildkit-${UPSTREAM_TAG}"
+          git worktree add --detach "${patched_worktree}" \
+            "refs/upstream-tags/${UPSTREAM_TAG}"
+          git -C "${patched_worktree}" config user.name "RunsOn BuildKit Bot"
+          git -C "${patched_worktree}" config user.email \
+            "github-actions[bot]@users.noreply.github.com"
+
+          # git am must apply every commit without intervention. Any conflict
+          # exits before the immutable tag is created or pushed.
+          git -C "${patched_worktree}" am "${patch_dir}"/*.patch
+          git -C "${patched_worktree}" tag -a "${runs_on_tag}" \
+            -m "BuildKit ${UPSTREAM_TAG} with the RunsOn cache export patch"
+          git -C "${patched_worktree}" push origin "refs/tags/${runs_on_tag}"
+
+          echo "runs-on-tag=${runs_on_tag}" >> "${GITHUB_OUTPUT}"
+
+  publish:
+    needs: patch
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/release-public-ecr.yml
+    with:
+      tag: ${{ needs.patch.outputs.runs-on-tag }}
+
