@@ -1,0 +1,79 @@
+name: Sync upstream BuildKit tags
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream-buildkit-tags
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      count: ${{ steps.tags.outputs.count }}
+      tags: ${{ steps.tags.outputs.tags }}
+    steps:
+      - name: Checkout RunsOn BuildKit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Discover new upstream tags
+        id: tags
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/moby/buildkit.git
+          git fetch --force --no-tags upstream \
+            'refs/tags/v*:refs/upstream-tags/v*'
+          git fetch --force --tags origin
+
+          sync_after_tag="$(<.github/buildkit-patches/sync-after-tag)"
+          sync_after_epoch="$(git for-each-ref \
+            --format='%(creatordate:unix)' \
+            "refs/upstream-tags/${sync_after_tag}")"
+          if [[ -z "${sync_after_epoch}" ]]; then
+            echo "Cannot resolve sync baseline ${sync_after_tag}" >&2
+            exit 1
+          fi
+
+          missing_tags=()
+          while IFS=$'\t' read -r created_epoch upstream_tag; do
+            if (( created_epoch <= sync_after_epoch )); then
+              continue
+            fi
+            runs_on_tag="${upstream_tag}-runs-on.1"
+            if ! git show-ref --verify --quiet "refs/tags/${runs_on_tag}"; then
+              missing_tags+=("${upstream_tag}")
+            fi
+          done < <(git for-each-ref \
+            --sort=creatordate \
+            --format='%(creatordate:unix)%09%(refname:strip=2)' \
+            refs/upstream-tags/)
+
+          tags_json="$(printf '%s\n' "${missing_tags[@]}" | \
+            jq -Rsc 'split("\n") | map(select(length > 0))')"
+          echo "count=${#missing_tags[@]}" >> "${GITHUB_OUTPUT}"
+          echo "tags=${tags_json}" >> "${GITHUB_OUTPUT}"
+          echo "New upstream tags: ${tags_json}"
+
+  sync:
+    needs: discover
+    if: needs.discover.outputs.count != '0'
+    strategy:
+      fail-fast: false
+      matrix:
+        upstream-tag: ${{ fromJSON(needs.discover.outputs.tags) }}
+    permissions:
+      contents: write
+      id-token: write
+    uses: ./.github/workflows/sync-upstream-tag.yml
+    with:
+      upstream-tag: ${{ matrix.upstream-tag }}
+

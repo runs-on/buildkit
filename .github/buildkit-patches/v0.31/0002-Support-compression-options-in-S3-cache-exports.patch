@@ -1,0 +1,53 @@
+From b1358da93401258bd66e6787262bc99b84d72a42 Mon Sep 17 00:00:00 2001
+From: Cyril Rohr <hey@cyrilrohr.com>
+Date: Fri, 31 Jul 2026 23:07:16 +0200
+Subject: [PATCH 2/5] Support compression options in S3 cache exports
+
+---
+ cache/remotecache/s3/s3.go | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/cache/remotecache/s3/s3.go b/cache/remotecache/s3/s3.go
+index b259ea618..5218ce562 100644
+--- a/cache/remotecache/s3/s3.go
++++ b/cache/remotecache/s3/s3.go
+@@ -207,21 +207,26 @@ func ResolveCacheExporterFunc() remotecache.ResolveCacheExporterFunc {
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		compressionConfig, err := compression.ParseAttributes(attrs)
++		if err != nil {
++			return nil, err
++		}
+ 
+ 		s3Client, err := newS3Client(ctx, config)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		cc := v1.NewCacheChains()
+-		return &exporter{CacheExporterTarget: cc, chains: cc, s3Client: s3Client, config: config}, nil
++		return &exporter{CacheExporterTarget: cc, chains: cc, s3Client: s3Client, config: config, compression: compressionConfig}, nil
+ 	}
+ }
+ 
+ type exporter struct {
+ 	solver.CacheExporterTarget
+-	chains   *v1.CacheChains
+-	s3Client *s3Client
+-	config   Config
++	chains      *v1.CacheChains
++	s3Client    *s3Client
++	config      Config
++	compression compression.Config
+ }
+ 
+ func (*exporter) Name() string {
+@@ -230,7 +235,7 @@ func (*exporter) Name() string {
+ 
+ func (e *exporter) Config() remotecache.Config {
+ 	return remotecache.Config{
+-		Compression: compression.New(compression.Default),
++		Compression: e.compression,
+ 	}
+ }
+ 

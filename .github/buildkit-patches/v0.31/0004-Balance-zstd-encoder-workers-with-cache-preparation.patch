@@ -1,0 +1,25 @@
+From c4758705e6273e26c3232a925105b5eee3e6715d Mon Sep 17 00:00:00 2001
+From: Cyril Rohr <hey@cyrilrohr.com>
+Date: Fri, 31 Jul 2026 23:36:49 +0200
+Subject: [PATCH 4/5] Balance zstd encoder workers with cache preparation
+
+---
+ util/compression/zstd.go | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/util/compression/zstd.go b/util/compression/zstd.go
+index dda92436b..bf1faf9a3 100644
+--- a/util/compression/zstd.go
++++ b/util/compression/zstd.go
+@@ -56,7 +56,10 @@ func zstdWriter(comp Config) func(io.Writer) (io.WriteCloser, error) {
+ 		if comp.Level != nil {
+ 			level = toZstdEncoderLevel(*comp.Level)
+ 		}
+-		return zstd.NewWriter(dest, zstd.WithEncoderLevel(level))
++		return zstd.NewWriter(dest,
++			zstd.WithEncoderLevel(level),
++			zstd.WithEncoderConcurrency(2),
++		)
+ 	}
+ }
+ 
