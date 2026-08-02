@@ -10,7 +10,7 @@ on:
 
 jobs:
   patch:
-    runs-on: ubuntu-24.04
+    runs-on: runs-on=${{ github.run_id }}-${{ inputs.upstream-tag }}/runner=1cpu-linux-x64
     permissions:
       contents: write
     outputs:
@@ -76,4 +76,3 @@ jobs:
     uses: ./.github/workflows/release-public-ecr.yml
     with:
       tag: ${{ needs.patch.outputs.runs-on-tag }}
-
