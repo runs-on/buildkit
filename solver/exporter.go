@@ -6,6 +6,7 @@ import (
 	"slices"
 
 	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/buildkit/util/compression"
 	digest "github.com/opencontainers/go-digest"
 )
 
@@ -187,7 +188,14 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 			}
 		}
 
-		if (remote == nil || opt.CompressionOpt != nil) && opt.Mode != CacheExportModeRemoteOnly {
+		// Loading a result materializes it in the local cache, which is costly for
+		// every imported record of a mode=max export. Skip it when the remote
+		// already has the requested compression.
+		needsLocalResult := remote == nil
+		if remote != nil && opt.CompressionOpt != nil && !remoteMatchesCompression(remote, *opt.CompressionOpt) {
+			needsLocalResult = true
+		}
+		if needsLocalResult && opt.Mode != CacheExportModeRemoteOnly {
 			res, err := cm.results.Load(ctx, res)
 			if err != nil {
 				if !errors.Is(err, cerrdefs.ErrNotFound) {
@@ -310,6 +318,25 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 		res[e] = append(res[e], out)
 	}
 	return res[e], nil
+}
+
+// remoteMatchesCompression reports whether every layer of remote already uses
+// the requested compression, so exporting it needs no conversion.
+func remoteMatchesCompression(remote *Remote, compressionOpt compression.Config) bool {
+	if remote == nil || len(remote.Descriptors) == 0 {
+		return false
+	}
+	// eStargz and gzip layers share a media type, so only the blob content tells
+	// them apart. Forced conversion between them must go through the local result.
+	if compressionOpt.Force && (compressionOpt.Type == compression.Gzip || compressionOpt.Type == compression.EStargz) {
+		return false
+	}
+	for _, desc := range remote.Descriptors {
+		if !compression.IsMediaType(compressionOpt.Type, desc.MediaType) {
+			return false
+		}
+	}
+	return true
 }
 
 func getBestResult(records []*CacheRecord) *CacheRecord {
