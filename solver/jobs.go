@@ -28,6 +28,14 @@ import (
 // ResolveOpFunc finds an Op implementation for a Vertex
 type ResolveOpFunc func(Vertex, Builder) (Op, error)
 
+// ResultHookKey is the job value key of a ResultHook.
+const ResultHookKey = "solver.resulthook"
+
+// ResultHook is called with the results of each vertex with inputs that a job
+// executes, as soon as they are computed. It must not block, and must clone
+// the results it keeps: they may be released once it returns.
+type ResultHook func(ctx context.Context, results []Result)
+
 type Builder interface {
 	Build(ctx context.Context, e Edge) (CachedResultWithProvenance, error)
 	InContext(ctx context.Context, f func(ctx context.Context, jobCtx JobContext) error) error
@@ -1207,6 +1215,15 @@ func (s *sharedOp) CacheMap(ctx context.Context, index int) (resp *cacheMapResp,
 	return &cacheMapResp{CacheMap: res[index], complete: s.cacheDone}, nil
 }
 
+func (s *sharedOp) notifyResultHooks(ctx context.Context, res []Result) {
+	_ = s.st.builder().EachValue(ctx, ResultHookKey, func(v any) error {
+		if hook, ok := v.(ResultHook); ok {
+			hook(ctx, res)
+		}
+		return nil
+	})
+}
+
 func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result, exporters []ExportableCacheKey, ctxOpts func(context.Context) context.Context, err error) {
 	defer func() {
 		err = errdefs.WithOp(err, s.st.vtx.Sys(), s.st.vtx.Options().Description)
@@ -1269,6 +1286,9 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 				s.subBuilder.mu.Unlock()
 
 				s.execRes = &execRes{execRes: wrapShared(res), execExporters: subExporters}
+				if err == nil && len(s.st.vtx.Inputs()) > 0 {
+					s.notifyResultHooks(ctx, res)
+				}
 			}
 			s.execErr = err
 		}

@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -205,6 +206,61 @@ func TestSingleLevelActiveGraph(t *testing.T) {
 
 	require.Equal(t, int64(1), *g4.Vertex.(*vertex).cacheCallCount)
 	require.Equal(t, int64(1), *g4.Vertex.(*vertex).execCallCount)
+}
+
+func TestResultHook(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	s := NewSolver(SolverOpt{
+		ResolveOpFunc: testOpResolver,
+		DefaultCache:  NewInMemoryCacheManager(),
+	})
+	defer s.Close()
+
+	var mu sync.Mutex
+	var hooked []string
+	hook := ResultHook(func(_ context.Context, results []Result) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, res := range results {
+			hooked = append(hooked, unwrap(res))
+		}
+	})
+	graph := func() Edge {
+		return Edge{
+			Vertex: vtx(vtxOpt{
+				name:         "v1",
+				cacheKeySeed: "seed1",
+				value:        "result1",
+				inputs: []Edge{{Vertex: vtx(vtxOpt{
+					name:         "v0",
+					cacheKeySeed: "seed0",
+					value:        "result0",
+				})}},
+			}),
+		}
+	}
+
+	// Executed vertices with inputs reach the hook; root vertices do not.
+	j0, err := s.NewJob("job0")
+	require.NoError(t, err)
+	j0.SetValue(ResultHookKey, hook)
+	res, err := j0.Build(ctx, graph())
+	require.NoError(t, err)
+	require.Equal(t, "result1", unwrap(res))
+	require.NoError(t, j0.Discard())
+	require.Equal(t, []string{"result1"}, hooked)
+
+	// Results loaded from the cache were not computed by the job.
+	j1, err := s.NewJob("job1")
+	require.NoError(t, err)
+	j1.SetValue(ResultHookKey, hook)
+	res, err = j1.Build(ctx, graph())
+	require.NoError(t, err)
+	require.Equal(t, "result1", unwrap(res))
+	require.NoError(t, j1.Discard())
+	require.Equal(t, []string{"result1"}, hooked)
 }
 
 func TestSingleLevelCache(t *testing.T) {

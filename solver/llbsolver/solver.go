@@ -263,6 +263,11 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 	}
 	j.SetValue(compat.JobValueKey, compatibilityVersion)
 
+	if eager := newEagerCacheExport(ctx, exp, session.NewGroup(sessionID)); eager != nil {
+		defer eager.close()
+		j.SetValue(solver.ResultHookKey, solver.ResultHook(eager.hook))
+	}
+
 	j.SessionID = sessionID
 
 	br := s.bridge(j, withBridgeProxyNetwork(proxyNetwork || s.proxyNetwork))
