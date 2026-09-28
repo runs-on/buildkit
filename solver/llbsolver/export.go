@@ -130,9 +130,11 @@ func runCacheExporters(ctx context.Context, exporters []RemoteCacheExporter, j *
 					// all keys have same export chain so exporting others is not needed
 					exporter := res.CacheKeys()[0].Exporter
 					if exp.CacheExportMode == solver.CacheExportModeMax {
-						if err := solver.PrepareCacheExport(ctx, exporter, opt, runtime.GOMAXPROCS(0)); err != nil {
+						prepared, err := solver.PrepareCacheExport(ctx, exporter, opt, runtime.GOMAXPROCS(0))
+						if err != nil {
 							return err
 						}
+						opt.Prepared = prepared
 					}
 					_, err = exporter.ExportTo(ctx, exp, opt)
 					return err
