@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRemoteMatchesCompression(t *testing.T) {
+func TestNeedsLocalResult(t *testing.T) {
 	gzipLayers := &Remote{Descriptors: []ocispecs.Descriptor{
 		{MediaType: ocispecs.MediaTypeImageLayerGzip},
 		{MediaType: ocispecs.MediaTypeImageLayerGzip},
@@ -18,34 +18,36 @@ func TestRemoteMatchesCompression(t *testing.T) {
 	zstdLayers := &Remote{Descriptors: []ocispecs.Descriptor{
 		{MediaType: ocispecs.MediaTypeImageLayerZstd},
 	}}
+	// e.g. zstd layers built on top of a gzip base image.
+	mixedLayers := &Remote{Descriptors: []ocispecs.Descriptor{
+		{MediaType: ocispecs.MediaTypeImageLayerGzip},
+		{MediaType: ocispecs.MediaTypeImageLayerZstd},
+	}}
+	withCompression := func(c compression.Config) CacheExportOpt {
+		return CacheExportOpt{CompressionOpt: &c}
+	}
 
 	tests := []struct {
 		name   string
 		remote *Remote
-		config compression.Config
-		match  bool
+		opt    CacheExportOpt
+		needed bool
 	}{
-		{name: "nil remote", config: compression.New(compression.Gzip)},
-		{name: "empty remote", remote: &Remote{}, config: compression.New(compression.Gzip)},
-		{name: "all gzip", remote: gzipLayers, config: compression.New(compression.Gzip), match: true},
-		{
-			name: "mixed compression",
-			remote: &Remote{Descriptors: []ocispecs.Descriptor{
-				{MediaType: ocispecs.MediaTypeImageLayerGzip},
-				{MediaType: ocispecs.MediaTypeImageLayerZstd},
-			}},
-			config: compression.New(compression.Gzip),
-		},
-		{name: "zstd", remote: zstdLayers, config: compression.New(compression.Zstd), match: true},
-		{name: "forced zstd", remote: zstdLayers, config: compression.New(compression.Zstd).SetForce(true), match: true},
-		{name: "estargz without force", remote: gzipLayers, config: compression.New(compression.EStargz), match: true},
-		{name: "forced gzip", remote: gzipLayers, config: compression.New(compression.Gzip).SetForce(true)},
-		{name: "forced estargz", remote: gzipLayers, config: compression.New(compression.EStargz).SetForce(true)},
+		{name: "no remote", opt: withCompression(compression.New(compression.Gzip)), needed: true},
+		{name: "no compression option", remote: gzipLayers},
+		{name: "gzip", remote: gzipLayers, opt: withCompression(compression.New(compression.Gzip))},
+		{name: "zstd requested for gzip layers", remote: gzipLayers, opt: withCompression(compression.New(compression.Zstd))},
+		{name: "zstd requested for mixed layers", remote: mixedLayers, opt: withCompression(compression.New(compression.Zstd))},
+		{name: "forced zstd for zstd layers", remote: zstdLayers, opt: withCompression(compression.New(compression.Zstd).SetForce(true))},
+		{name: "forced zstd for gzip layers", remote: gzipLayers, opt: withCompression(compression.New(compression.Zstd).SetForce(true)), needed: true},
+		{name: "forced zstd for mixed layers", remote: mixedLayers, opt: withCompression(compression.New(compression.Zstd).SetForce(true)), needed: true},
+		{name: "forced gzip", remote: gzipLayers, opt: withCompression(compression.New(compression.Gzip).SetForce(true)), needed: true},
+		{name: "forced estargz", remote: gzipLayers, opt: withCompression(compression.New(compression.EStargz).SetForce(true)), needed: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.match, remoteMatchesCompression(tt.remote, tt.config))
+			require.Equal(t, tt.needed, needsLocalResult(tt.remote, tt.opt))
 		})
 	}
 }

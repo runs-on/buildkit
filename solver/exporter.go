@@ -188,14 +188,7 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 			}
 		}
 
-		// Loading a result materializes it in the local cache, which is costly for
-		// every imported record of a mode=max export. Skip it when the remote
-		// already has the requested compression.
-		needsLocalResult := remote == nil
-		if remote != nil && opt.CompressionOpt != nil && !remoteMatchesCompression(remote, *opt.CompressionOpt) {
-			needsLocalResult = true
-		}
-		if needsLocalResult && opt.Mode != CacheExportModeRemoteOnly {
+		if needsLocalResult(remote, opt) && opt.Mode != CacheExportModeRemoteOnly {
 			res, err := cm.results.Load(ctx, res)
 			if err != nil {
 				if !errors.Is(err, cerrdefs.ErrNotFound) {
@@ -318,6 +311,21 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 		res[e] = append(res[e], out)
 	}
 	return res[e], nil
+}
+
+// needsLocalResult reports whether the remote of a record has to be resolved
+// from its local result. Loading a result materializes it in the local cache,
+// which is costly for every imported record of a mode=max export. Without
+// forced compression, resolving keeps the blobs a remote already has, so it is
+// only needed when there is no remote or when its layers must be converted.
+func needsLocalResult(remote *Remote, opt CacheExportOpt) bool {
+	if remote == nil {
+		return true
+	}
+	if opt.CompressionOpt == nil || !opt.CompressionOpt.Force {
+		return false
+	}
+	return !remoteMatchesCompression(remote, *opt.CompressionOpt)
 }
 
 // remoteMatchesCompression reports whether every layer of remote already uses
