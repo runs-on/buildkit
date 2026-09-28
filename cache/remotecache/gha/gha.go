@@ -286,6 +286,9 @@ func (ce *exporter) Finalize(ctx context.Context) (_ map[string]string, err erro
 	ce.initActiveKeyMap(ctx)
 	eg, egCtx := errgroup.WithContext(ctx)
 	eg.SetLimit(int(limited.Default.Size()))
+	// A blob backs one layer per parent chain it appears in; upload it once,
+	// as concurrent uploads of the same key would race each other.
+	uploads := map[string]struct{}{}
 	for i, l := range config.Layers {
 		dgstPair, ok := descs[l.Blob]
 		if !ok {
@@ -306,7 +309,10 @@ func (ce *exporter) Finalize(ctx context.Context) (_ map[string]string, err erro
 		diffID = dgst
 
 		key := blobKey(dgstPair.Descriptor.Digest)
-		if _, ok := ce.keyMap[key]; !ok {
+		_, exists := ce.keyMap[key]
+		_, scheduled := uploads[key]
+		if !exists && !scheduled {
+			uploads[key] = struct{}{}
 			eg.Go(func() error {
 				return ce.uploadBlob(egCtx, key, l.Blob, dgstPair)
 			})
