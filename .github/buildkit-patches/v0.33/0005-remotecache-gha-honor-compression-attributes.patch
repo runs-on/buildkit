@@ -1,0 +1,193 @@
+From 508cff4d67d20e07b53ec14ff5b4958c04b10573 Mon Sep 17 00:00:00 2001
+From: Cyril Rohr <hey@cyrilrohr.com>
+Date: Tue, 29 Sep 2026 12:16:36 +0200
+Subject: [PATCH 5/7] remotecache/gha: honor compression attributes
+
+The gha cache exporter returned a hardcoded compression.New(compression.
+Default) from Config(), so compression, compression-level and
+force-compression passed to --export-cache type=gha were silently ignored
+and every layer was exported as gzip, as the s3 exporter did before the
+previous commit.
+
+Finalize already records each layer's media type in the cache config and
+the importer reads it back, so blobs of any supported compression
+round-trip. Like the s3 backend, parse the attributes when resolving the
+exporter and return them from Config(). The importer shares getConfig and
+keeps ignoring them. NewExporter keeps the default compression.
+
+Signed-off-by: Cyril Rohr <hey@cyrilrohr.com>
+---
+ README.md                            |  3 ++
+ cache/remotecache/gha/config_test.go | 81 ++++++++++++++++++++++++++++
+ cache/remotecache/gha/gha.go         | 31 ++++++++---
+ 3 files changed, 107 insertions(+), 8 deletions(-)
+ create mode 100644 cache/remotecache/gha/config_test.go
+
+diff --git a/README.md b/README.md
+index daa3ee399..d76e00319 100644
+--- a/README.md
++++ b/README.md
+@@ -544,6 +544,9 @@ in your workflow to expose the runtime.
+ * `scope=<scope>`: which scope cache object belongs to (default `buildkit`)
+ * `ignore-error=<false|true>`: specify if error is ignored in case cache export fails (default: `false`)
+ * `timeout=<duration>`: sets the timeout duration for cache export (default: `10m`)
++* `compression=<uncompressed|gzip|estargz|zstd>`: choose compression type for layers newly created and cached, gzip is default value. `estargz` layers are recorded as plain `gzip` layers in the cache manifest (their eStargz annotations are not preserved), so they cannot be lazily pulled from the GitHub Actions cache
++* `compression-level=<value>`: compression level for gzip, estargz (0-9) and zstd (0-22)
++* `force-compression=true`: forcibly apply `compression` option to all layers
+ 
+ `--import-cache` options:
+ * `type=gha`
+diff --git a/cache/remotecache/gha/config_test.go b/cache/remotecache/gha/config_test.go
+new file mode 100644
+index 000000000..95e7dd749
+--- /dev/null
++++ b/cache/remotecache/gha/config_test.go
+@@ -0,0 +1,81 @@
++package gha
++
++import (
++	"maps"
++	"testing"
++	"time"
++
++	"github.com/golang-jwt/jwt/v5"
++	"github.com/moby/buildkit/util/compression"
++	"github.com/stretchr/testify/require"
++)
++
++// TestExporterCompressionAttributes checks that the compression attributes
++// passed to --export-cache are reflected in the exporter config instead of
++// always falling back to the default compression, and that invalid values are
++// rejected when the exporter is resolved.
++func TestExporterCompressionAttributes(t *testing.T) {
++	tests := []struct {
++		name    string
++		attrs   map[string]string
++		want    compression.Config
++		wantErr string
++	}{
++		{
++			name:  "default",
++			attrs: map[string]string{},
++			want:  compression.New(compression.Default),
++		},
++		{
++			name:  "zstd",
++			attrs: map[string]string{"compression": "zstd"},
++			want:  compression.New(compression.Zstd),
++		},
++		{
++			name:  "level",
++			attrs: map[string]string{"compression": "zstd", "compression-level": "1"},
++			want:  compression.New(compression.Zstd).SetLevel(1),
++		},
++		{
++			name:  "force",
++			attrs: map[string]string{"compression": "zstd", "force-compression": "true"},
++			want:  compression.New(compression.Zstd).SetForce(true),
++		},
++		{
++			name:    "unknown compression type",
++			attrs:   map[string]string{"compression": "lzma"},
++			wantErr: "unsupported compression type lzma",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			exp, err := ResolveCacheExporterFunc(nil, nil)(t.Context(), nil, testAttrs(t, tt.attrs))
++			if tt.wantErr != "" {
++				require.ErrorContains(t, err, tt.wantErr)
++				return
++			}
++			require.NoError(t, err)
++			require.Equal(t, tt.want, exp.Config().Compression)
++		})
++	}
++
++	// Compression only applies to exports: importing ignores the attributes.
++	_, _, err := ResolveCacheImporterFunc(nil, nil)(t.Context(), nil, testAttrs(t, map[string]string{"compression": "lzma"}))
++	require.NoError(t, err)
++}
++
++// testAttrs adds a valid runtime token and cache URL to attrs: resolving
++// parses the token's claims but doesn't contact the cache.
++func testAttrs(t *testing.T, attrs map[string]string) map[string]string {
++	t.Helper()
++	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
++		"ac":  "[]",
++		"nbf": time.Now().Add(-time.Minute).Unix(),
++		"exp": time.Now().Add(time.Hour).Unix(),
++	}).SignedString([]byte("test"))
++	require.NoError(t, err)
++	all := map[string]string{attrToken: token, attrURL: "http://cache.invalid/"}
++	maps.Copy(all, attrs)
++	return all
++}
+diff --git a/cache/remotecache/gha/gha.go b/cache/remotecache/gha/gha.go
+index a340d378e..ca3b43a3c 100644
+--- a/cache/remotecache/gha/gha.go
++++ b/cache/remotecache/gha/gha.go
+@@ -143,20 +143,35 @@ func ResolveCacheExporterFunc(conf *ghatypes.CacheConfig, v VerifierProvider) re
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-		return NewExporter(cfg)
++		compressionConfig, err := compression.ParseAttributes(attrs)
++		if err != nil {
++			return nil, err
++		}
++		return newExporter(cfg, compressionConfig)
+ 	}
+ }
+ 
+ type exporter struct {
+ 	solver.CacheExporterTarget
+-	chains     *v1.CacheChains
+-	cache      *actionscache.Cache
+-	config     *Config
+-	keyMapOnce sync.Once
+-	keyMap     map[string]struct{}
++	chains      *v1.CacheChains
++	cache       *actionscache.Cache
++	config      *Config
++	compression compression.Config
++	keyMapOnce  sync.Once
++	keyMap      map[string]struct{}
+ }
+ 
++// NewExporter returns an exporter that compresses new layers with the default
++// compression.
+ func NewExporter(c *Config) (remotecache.Exporter, error) {
++	e, err := newExporter(c, compression.New(compression.Default))
++	if err != nil {
++		return nil, err
++	}
++	return e, nil
++}
++
++func newExporter(c *Config, comp compression.Config) (*exporter, error) {
+ 	cc := v1.NewCacheChains()
+ 	cache, err := actionscache.New(c.Token, c.URL, c.Version > 1, actionscache.Opt{
+ 		Client:    tracing.DefaultClient,
+@@ -166,7 +181,7 @@ func NewExporter(c *Config) (remotecache.Exporter, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return &exporter{CacheExporterTarget: cc, chains: cc, cache: cache, config: c}, nil
++	return &exporter{CacheExporterTarget: cc, chains: cc, cache: cache, config: c, compression: comp}, nil
+ }
+ 
+ func (*exporter) Name() string {
+@@ -175,7 +190,7 @@ func (*exporter) Name() string {
+ 
+ func (ce *exporter) Config() remotecache.Config {
+ 	return remotecache.Config{
+-		Compression: compression.New(compression.Default),
++		Compression: ce.compression,
+ 	}
+ }
+ 
+-- 
+2.51.0
+
