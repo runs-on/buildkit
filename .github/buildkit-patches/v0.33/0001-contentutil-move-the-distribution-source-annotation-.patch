@@ -1,7 +1,7 @@
 From 35f73264ab6ca33ff793e49d16b04afda96cbb35 Mon Sep 17 00:00:00 2001
 From: Cyril Rohr <hey@cyrilrohr.com>
 Date: Tue, 29 Sep 2026 12:13:07 +0200
-Subject: [PATCH 1/7] contentutil: move the distribution source annotation
+Subject: [PATCH 1/8] contentutil: move the distribution source annotation
  helper out of getRemote
 
 getRemote records the image a lazy blob comes from in the

@@ -1,7 +1,7 @@
 From eb844b13c929baec46ee7bc0eb1ae4a0114bfac9 Mon Sep 17 00:00:00 2001
 From: Cyril Rohr <hey@cyrilrohr.com>
 Date: Tue, 29 Sep 2026 12:15:07 +0200
-Subject: [PATCH 3/7] solver: reuse imported cache remotes when exporting
+Subject: [PATCH 3/8] solver: reuse imported cache remotes when exporting
 
 When a remote cache export reaches a record that came from an imported
 cache, ExportTo loads the result into the local cache (FromRemote, then
