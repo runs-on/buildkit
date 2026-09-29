@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/core/transfer"
 	cerrdefs "github.com/containerd/errdefs"
 	distreference "github.com/distribution/reference"
 	"github.com/moby/buildkit/session"
@@ -135,10 +138,32 @@ func newResolver(hosts docker.RegistryHosts, handler *authHandlerNS, sm *session
 		headers: headers,
 	}
 
-	r.Resolver = docker.NewResolver(docker.ResolverOptions{
+	r.Resolver = newDockerResolver(docker.ResolverOptions{
 		Hosts:   r.HostsFunc,
 		Headers: headers,
 	})
+	return r
+}
+
+// newDockerResolver returns a containerd resolver that fetches large blobs
+// with parallel range requests when BUILDKIT_REGISTRY_FETCH_PARALLELISM is
+// set: a single stream from a registry backed by object storage, like ECR,
+// is much slower than the instance's bandwidth.
+func newDockerResolver(opts docker.ResolverOptions) remotes.Resolver {
+	r := docker.NewResolver(opts)
+	parallelism, _ := strconv.Atoi(os.Getenv("BUILDKIT_REGISTRY_FETCH_PARALLELISM"))
+	if parallelism <= 1 {
+		return r
+	}
+	chunkSize := 16 << 20
+	if v, err := strconv.Atoi(os.Getenv("BUILDKIT_REGISTRY_FETCH_CHUNK_SIZE")); err == nil && v > 0 {
+		chunkSize = v
+	}
+	if s, ok := r.(interface {
+		SetOptions(...transfer.ImageResolverOption)
+	}); ok {
+		s.SetOptions(transfer.WithMaxConcurrentDownloads(parallelism), transfer.WithConcurrentLayerFetchBuffer(chunkSize))
+	}
 	return r
 }
 
@@ -214,7 +239,7 @@ func (r *Resolver) WithSession(s session.Group) *Resolver {
 	r2 := *r
 	r2.auth = nil
 	r2.g = s
-	r2.Resolver = docker.NewResolver(docker.ResolverOptions{
+	r2.Resolver = newDockerResolver(docker.ResolverOptions{
 		Hosts:   r2.HostsFunc, // this refers to the newly-configured session so we need to recreate the resolver.
 		Headers: r2.headers.Clone(),
 	})
