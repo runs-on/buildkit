@@ -68,6 +68,8 @@ jobs:
     if: needs.discover.outputs.count != '0'
     strategy:
       fail-fast: false
+      # One tag at a time, oldest first, so stable tag promotions don't race.
+      max-parallel: 1
       matrix:
         upstream-tag: ${{ fromJSON(needs.discover.outputs.tags) }}
     permissions:
