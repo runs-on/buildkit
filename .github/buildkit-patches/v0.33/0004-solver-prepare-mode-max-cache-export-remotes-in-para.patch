@@ -1,0 +1,490 @@
+From 290a53c6138f259d3d080c9d0057e9fc838b544b Mon Sep 17 00:00:00 2001
+From: Cyril Rohr <hey@cyrilrohr.com>
+Date: Tue, 29 Sep 2026 09:06:15 +0200
+Subject: [PATCH 4/4] solver: prepare mode=max cache export remotes in parallel
+
+ExportTo walks cache records one at a time, so a mode=max export creates
+the blobs of independent stages sequentially. PrepareCacheExport walks
+the same records first and resolves them in parallel across independent
+branches, bounded by GOMAXPROCS. Like ExportTo, a record is prepared
+before its dependencies, which then usually find their blobs among the
+ones created for its chain. ExportTo reuses the prepared remotes through
+CacheExportOpt.Prepared instead of loading the results again; errors are
+still reported by ExportTo, so the exported cache does not change.
+
+Signed-off-by: Cyril Rohr <hey@cyrilrohr.com>
+---
+ solver/exporter.go              |  17 +--
+ solver/exporter_prepare.go      | 207 ++++++++++++++++++++++++++++++++
+ solver/exporter_prepare_test.go | 146 ++++++++++++++++++++++
+ solver/llbsolver/export.go      |  16 ++-
+ solver/types.go                 |   3 +
+ 5 files changed, 375 insertions(+), 14 deletions(-)
+ create mode 100644 solver/exporter_prepare.go
+ create mode 100644 solver/exporter_prepare_test.go
+
+diff --git a/solver/exporter.go b/solver/exporter.go
+index 9ab4c9be4..2a44683eb 100644
+--- a/solver/exporter.go
++++ b/solver/exporter.go
+@@ -5,7 +5,6 @@ import (
+ 	"errors"
+ 	"slices"
+ 
+-	cerrdefs "github.com/containerd/errdefs"
+ 	"github.com/moby/buildkit/util/compression"
+ 	digest "github.com/opencontainers/go-digest"
+ )
+@@ -170,7 +169,8 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
+ 			return nil, err
+ 		}
+ 
+-		remotes, err := cm.results.LoadRemotes(ctx, res, opt.CompressionOpt, opt.Session)
++		prepared := opt.Prepared.lookup(cm, res.ID)
++		remotes, err := prepared.loadRemotes(ctx, cm, res, opt)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -189,18 +189,13 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
+ 		}
+ 
+ 		if needsLocalResult(remote, opt) && opt.Mode != CacheExportModeRemoteOnly {
+-			res, err := cm.results.Load(ctx, res)
++			remotes, found, err := prepared.resolveRemotes(ctx, cm, res, opt)
+ 			if err != nil {
+-				if !errors.Is(err, cerrdefs.ErrNotFound) {
+-					return nil, err
+-				}
++				return nil, err
++			}
++			if !found {
+ 				remote = nil
+ 			} else {
+-				remotes, err := opt.ResolveRemotes(ctx, res)
+-				if err != nil {
+-					return nil, err
+-				}
+-				res.Release(context.TODO())
+ 				if remote == nil && len(remotes) > 0 {
+ 					remote, remotes = remotes[0], remotes[1:] // pop the first element
+ 				}
+diff --git a/solver/exporter_prepare.go b/solver/exporter_prepare.go
+new file mode 100644
+index 000000000..2051bb2e2
+--- /dev/null
++++ b/solver/exporter_prepare.go
+@@ -0,0 +1,207 @@
++package solver
++
++import (
++	"context"
++	"slices"
++	"sync"
++
++	cerrdefs "github.com/containerd/errdefs"
++	"github.com/pkg/errors"
++	"golang.org/x/sync/errgroup"
++	"golang.org/x/sync/semaphore"
++)
++
++// PreparedCacheExport holds the remotes that PrepareCacheExport resolved, so
++// ExportTo does not load the same results again.
++type PreparedCacheExport struct {
++	mu      sync.Mutex
++	results map[preparedKey]*preparedResult
++}
++
++type preparedKey struct {
++	cm *cacheManager
++	id string
++}
++
++// preparedResult records what ExportTo would get from LoadRemotes and, when
++// the record needs its local result, from ResolveRemotes.
++type preparedResult struct {
++	loaded   []*Remote
++	remotes  []*Remote
++	resolved bool
++}
++
++func (p *PreparedCacheExport) lookup(cm *cacheManager, id string) *preparedResult {
++	if p == nil {
++		return nil
++	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	return p.results[preparedKey{cm: cm, id: id}]
++}
++
++func (p *PreparedCacheExport) store(cm *cacheManager, id string, r *preparedResult) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.results[preparedKey{cm: cm, id: id}] = r
++}
++
++// loadRemotes returns the remotes already available for res.
++func (r *preparedResult) loadRemotes(ctx context.Context, cm *cacheManager, res CacheResult, opt CacheExportOpt) ([]*Remote, error) {
++	if r != nil {
++		return r.loaded, nil
++	}
++	return cm.results.LoadRemotes(ctx, res, opt.CompressionOpt, opt.Session)
++}
++
++// resolveRemotes resolves the remotes of the local result of res. It reports
++// false when the result no longer exists.
++func (r *preparedResult) resolveRemotes(ctx context.Context, cm *cacheManager, res CacheResult, opt CacheExportOpt) ([]*Remote, bool, error) {
++	if r != nil && r.resolved {
++		return r.remotes, true, nil
++	}
++	lr, err := cm.results.Load(ctx, res)
++	if err != nil {
++		if errors.Is(err, cerrdefs.ErrNotFound) {
++			return nil, false, nil
++		}
++		return nil, false, err
++	}
++	remotes, err := opt.ResolveRemotes(ctx, lr)
++	if err != nil {
++		return nil, false, err
++	}
++	lr.Release(context.TODO())
++	return remotes, true, nil
++}
++
++// PrepareCacheExport resolves the remotes that ExportTo will need, in parallel
++// across independent records, and returns them for ExportTo to reuse through
++// CacheExportOpt.Prepared. ExportTo walks records one at a time, so on a
++// mode=max export it creates the blobs of independent stages sequentially.
++// Like ExportTo, a record is prepared before its dependencies, which then
++// usually find their blobs among the ones created for its chain. Failures are
++// not reported: ExportTo resolves those records itself and reports the error,
++// so the exported cache is the same.
++func PrepareCacheExport(ctx context.Context, e CacheExporter, opt CacheExportOpt, parallelism int) (*PreparedCacheExport, error) {
++	if parallelism < 1 {
++		parallelism = 1
++	}
++	eg, egCtx := errgroup.WithContext(ctx)
++	p := &exportPreparer{
++		eg:       eg,
++		ctx:      egCtx,
++		opt:      opt,
++		sem:      semaphore.NewWeighted(int64(parallelism)),
++		visited:  map[CacheExporter]struct{}{},
++		prepared: &PreparedCacheExport{results: map[preparedKey]*preparedResult{}},
++	}
++	p.visit(ctx, e)
++	if err := eg.Wait(); err != nil {
++		return nil, err
++	}
++	return p.prepared, nil
++}
++
++type exportPreparer struct {
++	eg       *errgroup.Group
++	ctx      context.Context
++	opt      CacheExportOpt
++	sem      *semaphore.Weighted
++	mu       sync.Mutex
++	visited  map[CacheExporter]struct{}
++	prepared *PreparedCacheExport
++}
++
++// visit prepares ce once, then its dependencies. It mirrors the traversal of
++// ExportTo, including how record context options are inherited by
++// dependencies but not by secondary exporters.
++func (p *exportPreparer) visit(ctx context.Context, ce CacheExporter) {
++	p.mu.Lock()
++	_, seen := p.visited[ce]
++	p.visited[ce] = struct{}{}
++	p.mu.Unlock()
++	if seen {
++		return
++	}
++
++	p.eg.Go(func() error {
++		switch e := ce.(type) {
++		case *mergedExporter:
++			for _, e := range e.exporters {
++				p.visit(ctx, e)
++			}
++		case *exporter:
++			mainCtx := ctx
++			if CacheOptGetterOf(ctx) == nil && e.recordCtxOpts != nil {
++				ctx = e.recordCtxOpts(ctx)
++			}
++			if err := p.prepareRecord(ctx, e); err != nil {
++				return err
++			}
++			for _, deps := range e.k.Deps() {
++				for _, dep := range deps {
++					p.visit(ctx, dep.CacheKey.Exporter)
++				}
++			}
++			if e.edge != nil {
++				for _, de := range e.edge.secondaryExporters {
++					p.visit(mainCtx, de.cacheKey.CacheKey.Exporter)
++				}
++			}
++		}
++		return nil
++	})
++}
++
++// prepareRecord loads the remotes of the record ExportTo would export for e
++// and resolves its local result when needed.
++func (p *exportPreparer) prepareRecord(ctx context.Context, e *exporter) error {
++	if e.override != nil && !*e.override {
++		return nil
++	}
++	if len(e.k.Deps()) == 0 && !p.opt.ExportRoots {
++		return nil
++	}
++	if p.opt.Mode == CacheExportModeRemoteOnly {
++		return nil
++	}
++
++	records := slices.Clone(e.records)
++	slices.SortStableFunc(records, compareCacheRecord)
++	if e.record != nil {
++		records = append([]*CacheRecord{e.record}, records...)
++	}
++	for _, v := range records {
++		cm := v.cacheManager
++		res, err := cm.backend.Load(cm.getID(v.key), v.ID)
++		if errors.Is(err, ErrNotFound) {
++			continue
++		}
++		if err != nil {
++			return nil
++		}
++		if err := p.sem.Acquire(p.ctx, 1); err != nil {
++			return err
++		}
++		defer p.sem.Release(1)
++		loaded, err := cm.results.LoadRemotes(ctx, res, p.opt.CompressionOpt, p.opt.Session)
++		if err != nil {
++			return nil
++		}
++		r := &preparedResult{loaded: loaded}
++		var remote *Remote
++		if len(loaded) > 0 {
++			remote = loaded[0]
++		}
++		if needsLocalResult(remote, p.opt) {
++			remotes, found, err := (*preparedResult)(nil).resolveRemotes(ctx, cm, res, p.opt)
++			if err == nil && found {
++				r.remotes, r.resolved = remotes, true
++			}
++		}
++		p.prepared.store(cm, res.ID, r)
++		return nil
++	}
++	return nil
++}
+diff --git a/solver/exporter_prepare_test.go b/solver/exporter_prepare_test.go
+new file mode 100644
+index 000000000..fdea57fda
+--- /dev/null
++++ b/solver/exporter_prepare_test.go
+@@ -0,0 +1,146 @@
++package solver
++
++import (
++	"context"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/moby/buildkit/identity"
++	"github.com/moby/buildkit/session"
++	"github.com/moby/buildkit/util/compression"
++	digest "github.com/opencontainers/go-digest"
++	"github.com/pkg/errors"
++	"github.com/stretchr/testify/require"
++)
++
++// countingResults counts the result storage calls that load results.
++type countingResults struct {
++	CacheResultStorage
++	loads       atomic.Int32
++	loadRemotes atomic.Int32
++}
++
++func (c *countingResults) Load(ctx context.Context, res CacheResult) (Result, error) {
++	c.loads.Add(1)
++	return c.CacheResultStorage.Load(ctx, res)
++}
++
++func (c *countingResults) LoadRemotes(ctx context.Context, res CacheResult, comp *compression.Config, g session.Group) ([]*Remote, error) {
++	c.loadRemotes.Add(1)
++	return c.CacheResultStorage.LoadRemotes(ctx, res, comp, g)
++}
++
++func TestPrepareCacheExport(t *testing.T) {
++	t.Parallel()
++	ctx := t.Context()
++
++	results := &countingResults{CacheResultStorage: NewInMemoryResultStorage()}
++	l := NewSolver(SolverOpt{
++		ResolveOpFunc: testOpResolver,
++		DefaultCache:  NewCacheManager(ctx, identity.NewID(), NewInMemoryCacheStorage(), results),
++	})
++	defer l.Close()
++
++	j, err := l.NewJob("j0")
++	require.NoError(t, err)
++	defer func() {
++		if j != nil {
++			j.Discard()
++		}
++	}()
++
++	branch := func(v int) Edge {
++		return Edge{Vertex: vtxSum(v, vtxOpt{inputs: []Edge{{Vertex: vtxConst(v, vtxOpt{})}}})}
++	}
++	res, err := j.Build(ctx, Edge{Vertex: vtxSum(1, vtxOpt{
++		inputs: []Edge{branch(10), branch(20), branch(30)},
++	})})
++	require.NoError(t, err)
++	require.NoError(t, j.Discard())
++	j = nil
++	exporter := res.CacheKeys()[0].Exporter
++
++	type calls struct{ loads, loadRemotes, resolves int32 }
++	var resolves atomic.Int32
++	var orderMu sync.Mutex
++	var order []string
++	countCalls := func(run func()) calls {
++		results.loads.Store(0)
++		results.loadRemotes.Store(0)
++		resolves.Store(0)
++		orderMu.Lock()
++		order = nil
++		orderMu.Unlock()
++		run()
++		return calls{results.loads.Load(), results.loadRemotes.Load(), resolves.Load()}
++	}
++	exportOpt := func(wait func(Result) error) CacheExportOpt {
++		opt := testExporterOpts(true)
++		resolve := opt.ResolveRemotes
++		opt.ResolveRemotes = func(ctx context.Context, r Result) ([]*Remote, error) {
++			resolves.Add(1)
++			orderMu.Lock()
++			order = append(order, r.ID())
++			orderMu.Unlock()
++			if err := wait(r); err != nil {
++				return nil, err
++			}
++			return resolve(ctx, r)
++		}
++		return opt
++	}
++	summary := func(target *testExporterTarget) map[digest.Digest][2]int {
++		m := map[digest.Digest][2]int{}
++		for _, r := range target.records {
++			v := m[r.dgst]
++			m[r.dgst] = [2]int{v[0] + r.results, v[1] + r.links}
++		}
++		return m
++	}
++
++	plainTarget := newTestExporterTarget()
++	plain := countCalls(func() {
++		_, err = exporter.ExportTo(ctx, plainTarget, exportOpt(func(Result) error { return nil }))
++		require.NoError(t, err)
++	})
++	require.Equal(t, int32(4), plain.resolves, "the root and the three branch results")
++
++	// The three branches are independent: each resolution waits for the other
++	// two, which only completes if they are prepared concurrently.
++	var arrivals sync.WaitGroup
++	arrivals.Add(3)
++	all := make(chan struct{})
++	go func() {
++		arrivals.Wait()
++		close(all)
++	}()
++	var arrived sync.Map
++	preparedTarget := newTestExporterTarget()
++	prepared := countCalls(func() {
++		opt := exportOpt(func(r Result) error {
++			if r.ID() == res.ID() {
++				return nil
++			}
++			if _, loaded := arrived.LoadOrStore(r.ID(), struct{}{}); !loaded {
++				arrivals.Done()
++			}
++			select {
++			case <-all:
++				return nil
++			case <-time.After(10 * time.Second):
++				return errors.New("branch results were not prepared concurrently")
++			}
++		})
++		p, err := PrepareCacheExport(ctx, exporter, opt, 4)
++		require.NoError(t, err)
++		opt.Prepared = p
++		_, err = exporter.ExportTo(ctx, preparedTarget, opt)
++		require.NoError(t, err)
++	})
++
++	require.Equal(t, plain, prepared, "preparing does not load or resolve any result twice")
++	require.Equal(t, res.ID(), order[0], "like ExportTo, a record is prepared before its dependencies")
++	require.Equal(t, summary(plainTarget), summary(preparedTarget))
++}
+diff --git a/solver/llbsolver/export.go b/solver/llbsolver/export.go
+index 414852eea..623e777c4 100644
+--- a/solver/llbsolver/export.go
++++ b/solver/llbsolver/export.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"maps"
++	"runtime"
+ 	"sync"
+ 	"time"
+ 
+@@ -120,13 +121,22 @@ func runCacheExporters(ctx context.Context, exporters []RemoteCacheExporter, j *
+ 					// Configure compression
+ 					compressionConfig := exp.Config().Compression
+ 
+-					// all keys have same export chain so exporting others is not needed
+-					_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, exp, solver.CacheExportOpt{
++					opt := solver.CacheExportOpt{
+ 						ResolveRemotes: workerRefResolver(cacheconfig.RefConfig{Compression: compressionConfig}, false, g),
+ 						Mode:           exp.CacheExportMode,
+ 						Session:        g,
+ 						CompressionOpt: &compressionConfig,
+-					})
++					}
++					// all keys have same export chain so exporting others is not needed
++					exporter := res.CacheKeys()[0].Exporter
++					if exp.CacheExportMode == solver.CacheExportModeMax {
++						prepared, err := solver.PrepareCacheExport(ctx, exporter, opt, runtime.GOMAXPROCS(0))
++						if err != nil {
++							return err
++						}
++						opt.Prepared = prepared
++					}
++					_, err = exporter.ExportTo(ctx, exp, opt)
+ 					return err
+ 				}); err != nil {
+ 					return prepareDone(err)
+diff --git a/solver/types.go b/solver/types.go
+index 9e5b4a6cf..178946cd9 100644
+--- a/solver/types.go
++++ b/solver/types.go
+@@ -122,6 +122,9 @@ type CacheExportOpt struct {
+ 	// IgnoreBacklinks defines if other cache chains for same result that did not
+ 	// participate in the current build should be exported.
+ 	IgnoreBacklinks bool
++	// Prepared holds the remotes resolved by PrepareCacheExport, which ExportTo
++	// reuses instead of loading the results again.
++	Prepared *PreparedCacheExport
+ }
+ 
+ // CacheExporter can export the artifacts of the build chain
+-- 
+2.51.0
+
