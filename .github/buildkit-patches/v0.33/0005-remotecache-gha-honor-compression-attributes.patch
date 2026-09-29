@@ -1,4 +1,4 @@
-From 508cff4d67d20e07b53ec14ff5b4958c04b10573 Mon Sep 17 00:00:00 2001
+From 1b345747e451370304dc86715fcfb5531b3adf08 Mon Sep 17 00:00:00 2001
 From: Cyril Rohr <hey@cyrilrohr.com>
 Date: Tue, 29 Sep 2026 12:16:36 +0200
 Subject: [PATCH 5/7] remotecache/gha: honor compression attributes
@@ -24,14 +24,14 @@ Signed-off-by: Cyril Rohr <hey@cyrilrohr.com>
  create mode 100644 cache/remotecache/gha/config_test.go
 
 diff --git a/README.md b/README.md
-index daa3ee399..d76e00319 100644
+index daa3ee399..3b5d70228 100644
 --- a/README.md
 +++ b/README.md
 @@ -544,6 +544,9 @@ in your workflow to expose the runtime.
  * `scope=<scope>`: which scope cache object belongs to (default `buildkit`)
  * `ignore-error=<false|true>`: specify if error is ignored in case cache export fails (default: `false`)
  * `timeout=<duration>`: sets the timeout duration for cache export (default: `10m`)
-+* `compression=<uncompressed|gzip|estargz|zstd>`: choose compression type for layers newly created and cached, gzip is default value. `estargz` layers are recorded as plain `gzip` layers in the cache manifest (their eStargz annotations are not preserved), so they cannot be lazily pulled from the GitHub Actions cache
++* `compression=<uncompressed|gzip|estargz|zstd>`: choose compression type for layers newly created and cached, gzip is default value. `estargz` layers are stored as plain `gzip` layers: the cache doesn't keep their eStargz annotations, and only registry caches can be lazily pulled
 +* `compression-level=<value>`: compression level for gzip, estargz (0-9) and zstd (0-22)
 +* `force-compression=true`: forcibly apply `compression` option to all layers
  
