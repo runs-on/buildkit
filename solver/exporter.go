@@ -6,6 +6,7 @@ import (
 	"slices"
 
 	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/buildkit/util/compression"
 	digest "github.com/opencontainers/go-digest"
 )
 
@@ -125,106 +126,22 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 	k := e.k.clone() // protect against *CacheKey internal ids mutation from other exports
 
 	recKey := rootKey(k.Digest(), k.Output())
-	results := []CacheExportResult{}
-
-	addRecord := true
-
-	if e.override != nil {
-		addRecord = *e.override
-	}
-
-	exportRecord := opt.ExportRoots
-	if len(deps) > 0 {
-		exportRecord = true
-	}
-
-	records := slices.Clone(e.records)
-	slices.SortStableFunc(records, compareCacheRecord)
-
-	var remote *Remote
-	var i int
 
 	mainCtx := ctx
-	if CacheOptGetterOf(ctx) == nil && e.recordCtxOpts != nil {
-		ctx = e.recordCtxOpts(ctx)
-	}
+	ctx = e.recordContext(ctx)
+
 	v := e.record
-	for exportRecord && addRecord {
-		if v == nil {
-			if i < len(records) {
-				v = records[i]
-				i++
-			} else {
-				break
+	var results []CacheExportResult
+	var remote *Remote
+	if e.exportsRecord(opt) {
+		r, ok := opt.Prepared.lookup(e)
+		if !ok {
+			var err error
+			if r, err = e.exportResults(ctx, k, opt); err != nil {
+				return nil, err
 			}
 		}
-		cm := v.cacheManager
-		key := cm.getID(v.key)
-		res, err := cm.backend.Load(key, v.ID)
-		if err != nil {
-			if errors.Is(err, ErrNotFound) {
-				v = nil
-				continue
-			}
-			return nil, err
-		}
-
-		remotes, err := cm.results.LoadRemotes(ctx, res, opt.CompressionOpt, opt.Session)
-		if err != nil {
-			return nil, err
-		}
-		if len(remotes) > 0 {
-			remote, remotes = remotes[0], remotes[1:] // pop the first element
-		}
-		if opt.CompressionOpt != nil {
-			for _, r := range remotes { // record all remaining remotes as well
-				results = append(results, CacheExportResult{
-					CreatedAt:  v.CreatedAt,
-					Result:     r,
-					EdgeVertex: k.vtx,
-					EdgeIndex:  k.output,
-				})
-			}
-		}
-
-		if (remote == nil || opt.CompressionOpt != nil) && opt.Mode != CacheExportModeRemoteOnly {
-			res, err := cm.results.Load(ctx, res)
-			if err != nil {
-				if !errors.Is(err, cerrdefs.ErrNotFound) {
-					return nil, err
-				}
-				remote = nil
-			} else {
-				remotes, err := opt.ResolveRemotes(ctx, res)
-				if err != nil {
-					return nil, err
-				}
-				res.Release(context.TODO())
-				if remote == nil && len(remotes) > 0 {
-					remote, remotes = remotes[0], remotes[1:] // pop the first element
-				}
-				if opt.CompressionOpt != nil {
-					for _, r := range remotes { // record all remaining remotes as well
-						results = append(results, CacheExportResult{
-							CreatedAt:  v.CreatedAt,
-							Result:     r,
-							EdgeVertex: k.vtx,
-							EdgeIndex:  k.output,
-						})
-					}
-				}
-			}
-		}
-
-		if remote != nil {
-			results = append(results, CacheExportResult{
-				CreatedAt:  v.CreatedAt,
-				Result:     remote,
-				EdgeVertex: k.vtx,
-				EdgeIndex:  k.output,
-			})
-		}
-		break
+		v, results, remote = r.record, r.results, r.remote
 	}
 
 	if remote != nil && opt.Mode == CacheExportModeMin {
@@ -232,30 +149,15 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 	}
 
 	srcs := make([][]CacheLink, len(deps))
-
-	for i, deps := range deps {
-		for _, dep := range deps {
-			rec, err := dep.CacheKey.Exporter.ExportTo(ctx, t, opt)
-			if err != nil {
-				continue
-			}
-			for _, r := range rec {
-				srcs[i] = append(srcs[i], CacheLink{Src: r, Selector: string(dep.Selector)})
-			}
+	e.eachChild(ctx, mainCtx, func(ctx context.Context, index int, selector string, child CacheExporter) {
+		recs, err := child.ExportTo(ctx, t, opt)
+		if err != nil {
+			return
 		}
-	}
-
-	if e.edge != nil {
-		for _, de := range e.edge.secondaryExporters {
-			recs, err := de.cacheKey.CacheKey.Exporter.ExportTo(mainCtx, t, opt)
-			if err != nil {
-				continue
-			}
-			for _, r := range recs {
-				srcs[de.index] = append(srcs[de.index], CacheLink{Src: r, Selector: de.cacheKey.Selector.String()})
-			}
+		for _, r := range recs {
+			srcs[index] = append(srcs[index], CacheLink{Src: r, Selector: selector})
 		}
-	}
+	})
 
 	if !opt.IgnoreBacklinks {
 		for cm, id := range k.ids {
@@ -310,6 +212,159 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 		res[e] = append(res[e], out)
 	}
 	return res[e], nil
+}
+
+// recordContext returns the context the record of e is resolved with, and
+// that its dependencies are exported with.
+func (e *exporter) recordContext(ctx context.Context) context.Context {
+	if CacheOptGetterOf(ctx) == nil && e.recordCtxOpts != nil {
+		return e.recordCtxOpts(ctx)
+	}
+	return ctx
+}
+
+// exportsRecord reports whether ExportTo exports the results of e's own
+// record, as opposed to only linking it to its dependencies.
+func (e *exporter) exportsRecord(opt CacheExportOpt) bool {
+	if e.override != nil && !*e.override {
+		return false
+	}
+	return opt.ExportRoots || len(e.k.Deps()) > 0
+}
+
+// eachChild calls fn for each exporter that ExportTo exports after e, in
+// order, with the context ExportTo passes it and the index and selector of
+// the dependency it links to.
+func (e *exporter) eachChild(ctx, mainCtx context.Context, fn func(ctx context.Context, index int, selector string, child CacheExporter)) {
+	for i, deps := range e.k.Deps() {
+		for _, dep := range deps {
+			fn(ctx, i, string(dep.Selector), dep.CacheKey.Exporter)
+		}
+	}
+	if e.edge != nil {
+		for _, de := range e.edge.secondaryExporters {
+			fn(mainCtx, de.index, de.cacheKey.Selector.String(), de.cacheKey.CacheKey.Exporter)
+		}
+	}
+}
+
+// exportResult is what ExportTo exports for the record of an exporter.
+type exportResult struct {
+	// record is the record whose results are exported, nil if none of the
+	// exporter's records still exists.
+	record  *CacheRecord
+	results []CacheExportResult
+	remote  *Remote
+}
+
+// exportResults finds the first record of e that still exists and resolves
+// the remotes of its result.
+func (e *exporter) exportResults(ctx context.Context, k *CacheKey, opt CacheExportOpt) (exportResult, error) {
+	records := slices.Clone(e.records)
+	slices.SortStableFunc(records, compareCacheRecord)
+
+	var r exportResult
+	var i int
+	v := e.record
+	for {
+		if v == nil {
+			if i < len(records) {
+				v = records[i]
+				i++
+			} else {
+				return exportResult{}, nil
+			}
+		}
+		cm := v.cacheManager
+		key := cm.getID(v.key)
+		res, err := cm.backend.Load(key, v.ID)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				v = nil
+				continue
+			}
+			return exportResult{}, err
+		}
+		r.record = v
+		addResult := func(remote *Remote) {
+			r.results = append(r.results, CacheExportResult{
+				CreatedAt:  v.CreatedAt,
+				Result:     remote,
+				EdgeVertex: k.vtx,
+				EdgeIndex:  k.output,
+			})
+		}
+
+		remotes, err := cm.results.LoadRemotes(ctx, res, opt.CompressionOpt, opt.Session)
+		if err != nil {
+			return exportResult{}, err
+		}
+		if len(remotes) > 0 {
+			r.remote, remotes = remotes[0], remotes[1:] // pop the first element
+		}
+		if opt.CompressionOpt != nil {
+			for _, remote := range remotes { // record all remaining remotes as well
+				addResult(remote)
+			}
+		}
+
+		if needsLocalResult(r.remote, opt) && opt.Mode != CacheExportModeRemoteOnly {
+			res, err := cm.results.Load(ctx, res)
+			if err != nil {
+				if !errors.Is(err, cerrdefs.ErrNotFound) {
+					return exportResult{}, err
+				}
+				r.remote = nil
+			} else {
+				remotes, err := opt.ResolveRemotes(ctx, res)
+				if err != nil {
+					return exportResult{}, err
+				}
+				res.Release(context.TODO())
+				if r.remote == nil && len(remotes) > 0 {
+					r.remote, remotes = remotes[0], remotes[1:] // pop the first element
+				}
+				if opt.CompressionOpt != nil {
+					for _, remote := range remotes { // record all remaining remotes as well
+						addResult(remote)
+					}
+				}
+			}
+		}
+
+		if r.remote != nil {
+			addResult(r.remote)
+		}
+		return r, nil
+	}
+}
+
+// needsLocalResult reports whether ExportTo must resolve a record's remote
+// from its local result rather than export the remote it already has.
+// Loading a result materializes it in the local cache, which is costly for
+// every imported record of a mode=max export. Resolving only changes the blobs
+// of an existing remote when compression is forced and a layer doesn't have it
+// yet (see getRemote), so it is needed when there is no remote or for that
+// conversion.
+func needsLocalResult(remote *Remote, opt CacheExportOpt) bool {
+	if remote == nil {
+		return true
+	}
+	comp := opt.CompressionOpt
+	if comp == nil || !comp.Force {
+		return false
+	}
+	// eStargz and gzip layers share a media type, so only their content tells
+	// them apart: a forced conversion between them always resolves.
+	if comp.Type == compression.Gzip || comp.Type == compression.EStargz {
+		return true
+	}
+	for _, desc := range remote.Descriptors {
+		if !compression.IsMediaType(comp.Type, desc.MediaType) {
+			return true
+		}
+	}
+	return false
 }
 
 func getBestResult(records []*CacheRecord) *CacheRecord {

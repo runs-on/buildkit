@@ -25,6 +25,7 @@ import (
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/progress"
+	"github.com/moby/buildkit/util/resolver/limited"
 	"github.com/moby/buildkit/util/tracing"
 	bkversion "github.com/moby/buildkit/version"
 	"github.com/moby/buildkit/worker"
@@ -143,20 +144,35 @@ func ResolveCacheExporterFunc(conf *ghatypes.CacheConfig, v VerifierProvider) re
 		if err != nil {
 			return nil, err
 		}
-		return NewExporter(cfg)
+		compressionConfig, err := compression.ParseAttributes(attrs)
+		if err != nil {
+			return nil, err
+		}
+		return newExporter(cfg, compressionConfig)
 	}
 }
 
 type exporter struct {
 	solver.CacheExporterTarget
-	chains     *v1.CacheChains
-	cache      *actionscache.Cache
-	config     *Config
-	keyMapOnce sync.Once
-	keyMap     map[string]struct{}
+	chains      *v1.CacheChains
+	cache       *actionscache.Cache
+	config      *Config
+	compression compression.Config
+	keyMapOnce  sync.Once
+	keyMap      map[string]struct{}
 }
 
+// NewExporter returns an exporter that compresses new layers with the default
+// compression.
 func NewExporter(c *Config) (remotecache.Exporter, error) {
+	e, err := newExporter(c, compression.New(compression.Default))
+	if err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+func newExporter(c *Config, comp compression.Config) (*exporter, error) {
 	cc := v1.NewCacheChains()
 	cache, err := actionscache.New(c.Token, c.URL, c.Version > 1, actionscache.Opt{
 		Client:    tracing.DefaultClient,
@@ -166,7 +182,7 @@ func NewExporter(c *Config) (remotecache.Exporter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &exporter{CacheExporterTarget: cc, chains: cc, cache: cache, config: c}, nil
+	return &exporter{CacheExporterTarget: cc, chains: cc, cache: cache, config: c, compression: comp}, nil
 }
 
 func (*exporter) Name() string {
@@ -175,7 +191,7 @@ func (*exporter) Name() string {
 
 func (ce *exporter) Config() remotecache.Config {
 	return remotecache.Config{
-		Compression: compression.New(compression.Default),
+		Compression: ce.compression,
 	}
 }
 
@@ -205,6 +221,36 @@ func indexKey(scope string, config *Config) string {
 		key += "-sig"
 	}
 	return key
+}
+
+// uploadBlob saves a layer blob unless the cache already has it.
+func (ce *exporter) uploadBlob(ctx context.Context, dgstPair v1.DescriptorProviderPair) error {
+	ce.initActiveKeyMap(ctx)
+	key := blobKey(dgstPair.Descriptor.Digest)
+	if ce.keyMap != nil {
+		if _, ok := ce.keyMap[key]; ok {
+			return nil
+		}
+	} else {
+		b, err := ce.cache.Load(ctx, key)
+		if err != nil {
+			return err
+		}
+		if b != nil {
+			return nil
+		}
+	}
+	layerDone := progress.OneOff(ctx, fmt.Sprintf("writing layer %s", dgstPair.Descriptor.Digest))
+	ra, err := dgstPair.Provider.ReaderAt(ctx, dgstPair.Descriptor)
+	if err != nil {
+		return layerDone(err)
+	}
+	if err := ce.cache.Save(ctx, key, ra); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return layerDone(errors.Wrap(err, "error writing layer blob"))
+		}
+	}
+	return layerDone(nil)
 }
 
 func (ce *exporter) initActiveKeyMap(ctx context.Context) {
@@ -243,7 +289,11 @@ func (ce *exporter) Finalize(ctx context.Context) (_ map[string]string, err erro
 		return nil, err
 	}
 
-	// TODO: push parallel
+	// Annotate every layer before uploading anything, so that an invalid layer
+	// fails the export before any upload starts. A blob backs one layer per
+	// parent chain it appears in and is uploaded once.
+	var blobs []v1.DescriptorProviderPair
+	seen := map[digest.Digest]struct{}{}
 	for i, l := range config.Layers {
 		dgstPair, ok := descs[l.Blob]
 		if !ok {
@@ -262,36 +312,9 @@ func (ce *exporter) Finalize(ctx context.Context) (_ map[string]string, err erro
 			return nil, errors.Wrapf(err, "failed to parse uncompressed annotation")
 		}
 		diffID = dgst
-		ce.initActiveKeyMap(ctx)
-
-		key := blobKey(dgstPair.Descriptor.Digest)
-
-		exists := false
-		if ce.keyMap != nil {
-			if _, ok := ce.keyMap[key]; ok {
-				exists = true
-			}
-		} else {
-			b, err := ce.cache.Load(ctx, key)
-			if err != nil {
-				return nil, err
-			}
-			if b != nil {
-				exists = true
-			}
-		}
-		if !exists {
-			layerDone := progress.OneOff(ctx, fmt.Sprintf("writing layer %s", l.Blob))
-			ra, err := dgstPair.Provider.ReaderAt(ctx, dgstPair.Descriptor)
-			if err != nil {
-				return nil, layerDone(err)
-			}
-			if err := ce.cache.Save(ctx, key, ra); err != nil {
-				if !errors.Is(err, os.ErrExist) {
-					return nil, layerDone(errors.Wrap(err, "error writing layer blob"))
-				}
-			}
-			layerDone(nil)
+		if _, ok := seen[l.Blob]; !ok {
+			seen[l.Blob] = struct{}{}
+			blobs = append(blobs, dgstPair)
 		}
 		la := &cacheimporttypes.LayerAnnotations{
 			DiffID:    diffID,
@@ -306,6 +329,19 @@ func (ce *exporter) Finalize(ctx context.Context) (_ map[string]string, err erro
 			la.CreatedAt = t.UTC()
 		}
 		config.Layers[i].Annotations = la
+	}
+
+	// Check and upload the blobs in parallel, bounded like registry cache
+	// pushes: one at a time, each takes a cache API round trip or more.
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.SetLimit(int(limited.Default.Size()))
+	for _, dgstPair := range blobs {
+		eg.Go(func() error {
+			return ce.uploadBlob(egCtx, dgstPair)
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return nil, err
 	}
 
 	dt, err := json.Marshal(config)
