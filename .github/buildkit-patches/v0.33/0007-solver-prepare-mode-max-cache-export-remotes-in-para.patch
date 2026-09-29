@@ -1,7 +1,7 @@
-From 7a4558e69767e783f7d4c1772f6e726826933070 Mon Sep 17 00:00:00 2001
+From df83f1f383d6b0b311459dc162d14c9d84f77032 Mon Sep 17 00:00:00 2001
 From: Cyril Rohr <hey@cyrilrohr.com>
 Date: Tue, 29 Sep 2026 12:22:53 +0200
-Subject: [PATCH 7/8] solver: prepare mode=max cache export remotes in parallel
+Subject: [PATCH 7/7] solver: prepare mode=max cache export remotes in parallel
 
 ExportTo walks cache records one at a time, so a mode=max export creates
 the blobs of independent stages sequentially. PrepareCacheExport walks

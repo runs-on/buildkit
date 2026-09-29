@@ -1,7 +1,7 @@
 From fb13466430a75b198d7ca04a8ca946afc35f96b9 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?Ernestas=20Luko=C5=A1evi=C4=8Dius?= <ernetas@gmail.com>
 Date: Sat, 5 Sep 2026 16:04:20 +0300
-Subject: [PATCH 4/8] remotecache/s3: honor compression attributes
+Subject: [PATCH 4/7] remotecache/s3: honor compression attributes
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
