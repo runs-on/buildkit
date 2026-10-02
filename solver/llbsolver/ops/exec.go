@@ -217,6 +217,9 @@ func (e *ExecOp) CacheMap(ctx context.Context, jobCtx solver.JobContext, index i
 		for _, d := range e.op.CdiDevices {
 			setup, ok := e.w.CDIManager().OnDemandInstaller(d.Name)
 			if ok {
+				if len(cm.Deps) == 0 {
+					return nil, false, errors.Errorf("cannot set up CDI device %q without an input", d.Name)
+				}
 				prev := cm.Deps[0].PreprocessFunc
 				cm.Deps[0].PreprocessFunc = func(ctx context.Context, r solver.Result, g session.Group) error {
 					if err := prev(ctx, r, g); err != nil {
@@ -452,8 +455,9 @@ func (e *ExecOp) Exec(ctx context.Context, jobCtx solver.JobContext, inputs []so
 	if err != nil {
 		return nil, err
 	}
+	args := e.op.Meta.Args
 	if emu != nil {
-		e.op.Meta.Args = append([]string{qemuMountName}, e.op.Meta.Args...)
+		args = append([]string{qemuMountName}, args...)
 
 		p.Mounts = append(p.Mounts, executor.Mount{
 			Readonly: true,
@@ -463,7 +467,7 @@ func (e *ExecOp) Exec(ctx context.Context, jobCtx solver.JobContext, inputs []so
 	}
 
 	meta := executor.Meta{
-		Args:                      e.op.Meta.Args,
+		Args:                      args,
 		Env:                       e.op.Meta.Env,
 		Cwd:                       e.op.Meta.Cwd,
 		User:                      e.op.Meta.User,
@@ -552,7 +556,7 @@ func (e *ExecOp) Exec(ctx context.Context, jobCtx solver.JobContext, inputs []so
 		p.OutputRefs[i].Ref = nil
 	}
 	e.rec = rec
-	return results, errors.Wrapf(execErr, "process %q did not complete successfully", strings.Join(e.op.Meta.Args, " "))
+	return results, errors.Wrapf(execErr, "process %q did not complete successfully", strings.Join(meta.Args, " "))
 }
 
 func logProxyRequests(w io.Writer, requests []network.ProxyRequest) {

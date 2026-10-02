@@ -2,11 +2,93 @@ package config
 
 import (
 	"bytes"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/moby/buildkit/util/db/compaction"
+
 	"github.com/stretchr/testify/require"
 )
+
+func TestLoadGCPolicyInvalidQuote(t *testing.T) {
+	for _, tc := range []struct {
+		field   string
+		wantErr string
+	}{
+		{"keepDuration", "invalid duration"},
+		{"reservedSpace", "invalid disk space"},
+		{"maxUsedSpace", "invalid disk space"},
+		{"minFreeSpace", "invalid disk space"},
+	} {
+		for _, value := range []string{`'"'`, `"\""`} {
+			t.Run(tc.field+"/"+value, func(t *testing.T) {
+				config := fmt.Sprintf("[[worker.oci.gcpolicy]]\n%s = %s\n", tc.field, value)
+				_, err := Load(strings.NewReader(config))
+				require.ErrorContains(t, err, tc.wantErr)
+			})
+		}
+	}
+}
+
+func TestCompactionConfig(t *testing.T) {
+	for _, enabled := range []string{"", "[compaction]\nenabled = false", "[compaction]\nenabled = true"} {
+		cfg, err := Load(strings.NewReader(enabled))
+		require.NoError(t, err)
+		require.Equal(t, strings.Contains(enabled, "true"), cfg.Compaction.Enabled)
+		policy, err := cfg.Compaction.Policy()
+		require.NoError(t, err)
+		expected := compaction.DefaultConfig()
+		expected.ManualOnly = !cfg.Compaction.Enabled
+		require.Equal(t, expected, policy)
+	}
+	cfg, err := Load(strings.NewReader(`[compaction]
+enabled = true
+idleTimeout = "5m"
+maxRetry = 0
+writesPerCheck = 1234
+sizeWatermark = 1073741824
+sizeGrowthPercent = 250
+minReclaimBytes = 536870912
+minReclaimPercent = 40
+`))
+	require.NoError(t, err)
+	policy, err := cfg.Compaction.Policy()
+	require.NoError(t, err)
+	require.Equal(t, 5*time.Minute, policy.IdleTimeout)
+	require.Zero(t, policy.MaxRetry)
+	require.Equal(t, uint64(1234), policy.WritesPerCheck)
+	require.Equal(t, int64(1073741824), policy.SizeWatermark)
+	require.Equal(t, int64(250), policy.SizeGrowthPercent)
+	require.Equal(t, int64(536870912), policy.MinReclaimBytes)
+	require.Equal(t, int64(40), policy.MinReclaimPercent)
+}
+
+func TestInvalidCompactionConfig(t *testing.T) {
+	for _, setting := range []string{
+		`idleTimeout = "0s"`,
+		`idleTimeout = "-1s"`,
+		`maxRetry = -1`,
+		`writesPerCheck = 0`,
+		`sizeWatermark = 0`,
+		`sizeWatermark = -1`,
+		`sizeGrowthPercent = 0`,
+		`sizeGrowthPercent = -1`,
+		`minReclaimBytes = 0`,
+		`minReclaimBytes = -1`,
+		`minReclaimPercent = 0`,
+		`minReclaimPercent = -1`,
+		`minReclaimPercent = 101`,
+	} {
+		t.Run(setting, func(t *testing.T) {
+			cfg, err := Load(strings.NewReader("[compaction]\nenabled = true\n" + setting))
+			require.NoError(t, err)
+			_, err = cfg.Compaction.Policy()
+			require.Error(t, err)
+		})
+	}
+}
 
 func TestLoad(t *testing.T) {
 	const testConfig = `
@@ -43,6 +125,7 @@ foo="bar"
 namespace="non-default"
 platforms=["linux/amd64"]
 address="containerd.sock"
+hypervIsolation=true
 [worker.containerd.runtime]
 name="exotic"
 path="/usr/bin/exotic"
@@ -77,6 +160,9 @@ cert="cert.pem"
 nameservers=["1.1.1.1","8.8.8.8"]
 options=["edns0"]
 searchDomains=["example.com"]
+
+[system]
+sessionAuthTimeout="60s"
 `
 
 	cfg, err := Load(bytes.NewBuffer([]byte(testConfig)))
@@ -110,6 +196,7 @@ searchDomains=["example.com"]
 	require.Nil(t, cfg.Workers.Containerd.Enabled)
 	require.Equal(t, 1, len(cfg.Workers.Containerd.Platforms))
 	require.Equal(t, "containerd.sock", cfg.Workers.Containerd.Address)
+	require.True(t, cfg.Workers.Containerd.HyperVIsolation)
 
 	require.Equal(t, 0, len(cfg.Workers.OCI.GCPolicy))
 	require.Equal(t, "non-default", cfg.Workers.Containerd.Namespace)
@@ -150,4 +237,62 @@ searchDomains=["example.com"]
 	require.Equal(t, []string{"1.1.1.1", "8.8.8.8"}, cfg.DNS.Nameservers)
 	require.Equal(t, []string{"example.com"}, cfg.DNS.SearchDomains)
 	require.Equal(t, []string{"edns0"}, cfg.DNS.Options)
+
+	require.NotNil(t, cfg.System)
+	require.Equal(t, 60*time.Second, cfg.System.SessionAuthTimeout.Duration)
+}
+
+func TestLoadHistoryMaxEntries(t *testing.T) {
+	tests := []struct {
+		name    string
+		toml    string
+		wantSet bool
+		want    int64
+	}{
+		{name: "unset", toml: "[history]\nmaxAge = 172800\n"},
+		{name: "disabled", toml: "[history]\nmaxEntries = 0\n", wantSet: true, want: 0},
+		{name: "configured", toml: "[history]\nmaxEntries = 12\n", wantSet: true, want: 12},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(bytes.NewBufferString(tc.toml))
+			require.NoError(t, err)
+			require.NotNil(t, cfg.History)
+			if tc.wantSet {
+				require.NotNil(t, cfg.History.MaxEntries)
+				require.Equal(t, tc.want, *cfg.History.MaxEntries)
+			} else {
+				require.Nil(t, cfg.History.MaxEntries)
+			}
+		})
+	}
+}
+
+func TestLoadSessionAuthTimeout(t *testing.T) {
+	tests := []struct {
+		name    string
+		toml    string
+		wantSet bool
+		want    time.Duration
+	}{
+		{name: "unset", toml: "[system]\n"},
+		{name: "disabled", toml: "[system]\nsessionAuthTimeout = 0\n", wantSet: true, want: 0},
+		{name: "configured", toml: "[system]\nsessionAuthTimeout = 300\n", wantSet: true, want: 300 * time.Second},
+		{name: "duration-string", toml: "[system]\nsessionAuthTimeout = \"60s\"\n", wantSet: true, want: 60 * time.Second},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(bytes.NewBufferString(tc.toml))
+			require.NoError(t, err)
+			require.NotNil(t, cfg.System)
+			if tc.wantSet {
+				require.NotNil(t, cfg.System.SessionAuthTimeout)
+				require.Equal(t, tc.want, cfg.System.SessionAuthTimeout.Duration)
+			} else {
+				require.Nil(t, cfg.System.SessionAuthTimeout)
+			}
+		})
+	}
 }

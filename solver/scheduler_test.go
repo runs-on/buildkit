@@ -1108,7 +1108,7 @@ func TestSlowCache(t *testing.T) {
 	j1 = nil
 }
 
-func TestSlowCacheErrorResultCloneRelease(t *testing.T) {
+func TestSlowCacheErrorResultReleasedWithJob(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 
@@ -1147,7 +1147,7 @@ func TestSlowCacheErrorResultCloneRelease(t *testing.T) {
 			},
 			slowCacheCompute: map[int]ResultBasedCacheFunc{
 				0: func(context.Context, Result, session.Group) (digest.Digest, error) {
-					return "", errors.Errorf("slow cache error")
+					return "", errors.New("slow cache error")
 				},
 			},
 		}),
@@ -1160,14 +1160,13 @@ func TestSlowCacheErrorResultCloneRelease(t *testing.T) {
 	require.ErrorAs(t, err, &sce)
 	require.NotNil(t, sce.Result)
 
-	require.NoError(t, j.Discard())
-	j = nil
-
 	require.Never(t, func() bool {
 		return releaseCount.Load() != 0
 	}, 100*time.Millisecond, 10*time.Millisecond)
 
-	require.NoError(t, sce.Result.Release(ctx))
+	require.NoError(t, j.Discard())
+	j = nil
+
 	require.Eventually(t, func() bool {
 		return releaseCount.Load() == 1
 	}, time.Second, 10*time.Millisecond)
@@ -1259,7 +1258,7 @@ func TestErrorReturns(t *testing.T) {
 					cacheKeySeed: "seed1",
 					value:        "result1",
 					cachePreFunc: func(ctx context.Context) error {
-						return errors.Errorf("error-from-test")
+						return errors.New("error-from-test")
 					},
 				})},
 				{Vertex: vtx(vtxOpt{
@@ -1346,7 +1345,7 @@ func TestErrorReturns(t *testing.T) {
 					cacheKeySeed: "seed3",
 					value:        "result2",
 					execPreFunc: func(ctx context.Context) error {
-						return errors.Errorf("exec-error-from-test")
+						return errors.New("exec-error-from-test")
 					},
 				})},
 			},
@@ -3536,6 +3535,35 @@ func TestInputRequestDeadlock(t *testing.T) {
 	j2 = nil
 }
 
+func TestCacheMapDependencyCount(t *testing.T) {
+	t.Parallel()
+
+	for _, depCount := range []int{0, 2} {
+		t.Run(fmt.Sprintf("deps=%d", depCount), func(t *testing.T) {
+			s := NewSolver(SolverOpt{
+				ResolveOpFunc: testOpResolver,
+			})
+			defer s.Close()
+
+			job, err := s.NewJob(fmt.Sprintf("invalid-cache-map-%d", depCount))
+			require.NoError(t, err)
+			defer job.Discard()
+
+			v := &invalidCacheMapVertex{
+				vertex: vtx(vtxOpt{
+					name: fmt.Sprintf("invalid-cache-map-%d", depCount),
+					inputs: []Edge{{
+						Vertex: vtx(vtxOpt{name: "input"}),
+					}},
+				}),
+				depCount: depCount,
+			}
+			_, err = job.Build(t.Context(), Edge{Vertex: v})
+			require.ErrorContains(t, err, fmt.Sprintf("invalid cache map: expected dependency count 1, got %d", depCount))
+		})
+	}
+}
+
 func TestUnknownBuildID(t *testing.T) {
 	s := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -3744,6 +3772,26 @@ type vertex struct {
 	execCallCount  *int64
 }
 
+type invalidCacheMapVertex struct {
+	*vertex
+	depCount int
+}
+
+func (v *invalidCacheMapVertex) Sys() any {
+	return v
+}
+
+func (v *invalidCacheMapVertex) CacheMap(context.Context, JobContext, int) (*CacheMap, bool, error) {
+	return &CacheMap{
+		Digest: digest.FromBytes([]byte(v.Name())),
+		Deps: make([]struct {
+			Selector          digest.Digest
+			ComputeDigestFunc ResultBasedCacheFunc
+			PreprocessFunc    PreprocessFunc
+		}, v.depCount),
+	}, true, nil
+}
+
 var _ Op = &vertex{}
 
 func (v *vertex) Digest() digest.Digest {
@@ -3834,7 +3882,7 @@ func (v *vertex) CacheMap(ctx context.Context, jobCtx JobContext, index int) (*C
 
 func (v *vertex) exec(ctx context.Context, inputs []Result) error {
 	if len(inputs) != len(v.Inputs()) {
-		return errors.Errorf("invalid number of inputs")
+		return errors.New("invalid number of inputs")
 	}
 	if f := v.opt.execPreFunc; f != nil {
 		if err := f(ctx); err != nil {
@@ -4089,7 +4137,7 @@ func testOpResolver(v Vertex, b Builder) (Op, error) {
 		return op, nil
 	}
 
-	return nil, errors.Errorf("invalid vertex")
+	return nil, errors.New("invalid vertex")
 }
 
 func unwrap(res Result) string {
@@ -4133,7 +4181,7 @@ type trackingCacheManager struct {
 func (cm *trackingCacheManager) Load(ctx context.Context, rec *CacheRecord) (Result, error) {
 	atomic.AddInt64(&cm.loadCounter, 1)
 	if cm.forceFail {
-		return nil, errors.Errorf("force fail")
+		return nil, errors.New("force fail")
 	}
 	return cm.CacheManager.Load(ctx, rec)
 }

@@ -26,8 +26,43 @@ func testLocalSourceDiffer(t *testing.T, sb integration.Sandbox) {
 	}
 }
 
+func testLocalSourceFilterOpt(t *testing.T, sb integration.Sandbox) {
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	dir := integration.Tmpdir(t,
+		fstest.CreateFile("keep.txt", []byte("keep"), 0600),
+		fstest.CreateFile("drop.txt", []byte("drop"), 0600),
+	)
+	def, err := llb.Local("source", llb.ExcludePatterns([]string{"!keep.txt"})).Marshal(sb.Context())
+	require.NoError(t, err)
+
+	destDir := t.TempDir()
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{{Type: ExporterLocal, OutputDir: destDir}},
+		LocalMounts: map[string]fsutil.FS{
+			"source": dir,
+		},
+		LocalFilterOpt: func(name string, opt *fsutil.FilterOpt) error {
+			if name != "source" {
+				return errors.Errorf("unexpected local source %q", name)
+			}
+			opt.ExcludePatterns = append([]string{"*.txt"}, opt.ExcludePatterns...)
+			return nil
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	data, err := os.ReadFile(filepath.Join(destDir, "keep.txt"))
+	require.NoError(t, err)
+	require.Equal(t, "keep", string(data))
+	_, err = os.Stat(filepath.Join(destDir, "drop.txt"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
 func testLocalSourceWithDiffer(t *testing.T, sb integration.Sandbox, d llb.DiffType) {
-	c, err := New(context.TODO(), sb.Address())
+	c, err := New(t.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -43,12 +78,12 @@ func testLocalSourceWithDiffer(t *testing.T, sb integration.Sandbox, d llb.DiffT
 
 	st := llb.Local("mylocal"+string(d), llb.Differ(d, false))
 
-	def, err := st.Marshal(context.TODO())
+	def, err := st.Marshal(t.Context())
 	require.NoError(t, err)
 
 	destDir := t.TempDir()
 
-	_, err = c.Solve(context.TODO(), def, SolveOpt{
+	_, err = c.Solve(t.Context(), def, SolveOpt{
 		Exports: []ExportEntry{
 			{
 				Type:      ExporterLocal,
@@ -74,7 +109,7 @@ func testLocalSourceWithDiffer(t *testing.T, sb integration.Sandbox, d llb.DiffT
 	err = syscall.UtimesNano(filepath.Join(dir.Name, "foo"), []syscall.Timespec{tv, tv})
 	require.NoError(t, err)
 
-	_, err = c.Solve(context.TODO(), def, SolveOpt{
+	_, err = c.Solve(t.Context(), def, SolveOpt{
 		Exports: []ExportEntry{
 			{
 				Type:      ExporterLocal,
@@ -100,7 +135,7 @@ func testLocalSourceWithDiffer(t *testing.T, sb integration.Sandbox, d llb.DiffT
 // moby/buildkit#4831
 func testLocalSourceWithHardlinksFilter(t *testing.T, sb integration.Sandbox) {
 	requiresLinux(t)
-	c, err := New(context.TODO(), sb.Address())
+	c, err := New(t.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -113,12 +148,12 @@ func testLocalSourceWithHardlinksFilter(t *testing.T, sb integration.Sandbox) {
 
 	st := llb.Local("mylocal", llb.FollowPaths([]string{"foo*"}))
 
-	def, err := st.Marshal(context.TODO())
+	def, err := st.Marshal(t.Context())
 	require.NoError(t, err)
 
 	destDir := t.TempDir()
 
-	_, err = c.Solve(context.TODO(), def, SolveOpt{
+	_, err = c.Solve(t.Context(), def, SolveOpt{
 		Exports: []ExportEntry{
 			{
 				Type:      ExporterLocal,

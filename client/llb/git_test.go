@@ -1,7 +1,6 @@
 package llb
 
 import (
-	"context"
 	"testing"
 
 	"github.com/moby/buildkit/solver/pb"
@@ -70,6 +69,27 @@ func TestGit(t *testing.T) {
 			},
 		},
 		{
+			name:       "git advice",
+			st:         Git("github.com/foo/bar.git", "ref", GitAdvice(true)),
+			identifier: "git://github.com/foo/bar.git#ref",
+			attrs: map[string]string{
+				"git.authheadersecret": "GIT_AUTH_HEADER",
+				"git.authtokensecret":  "GIT_AUTH_TOKEN",
+				"git.fullurl":          "https://github.com/foo/bar.git",
+				"git.advice":           "true",
+			},
+		},
+		{
+			name:       "git advice disabled",
+			st:         Git("github.com/foo/bar.git", "ref", GitAdvice(false)),
+			identifier: "git://github.com/foo/bar.git#ref",
+			attrs: map[string]string{
+				"git.authheadersecret": "GIT_AUTH_HEADER",
+				"git.authtokensecret":  "GIT_AUTH_TOKEN",
+				"git.fullurl":          "https://github.com/foo/bar.git",
+			},
+		},
+		{
 			name: "bundle",
 			st: Git(
 				"github.com/foo/bar.git", "",
@@ -122,7 +142,7 @@ func TestGit(t *testing.T) {
 	for _, tc := range tcases {
 		t.Run(tc.name, func(t *testing.T) {
 			st := tc.st
-			def, err := st.Marshal(context.TODO())
+			def, err := st.Marshal(t.Context())
 
 			require.NoError(t, err)
 

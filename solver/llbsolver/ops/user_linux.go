@@ -8,6 +8,7 @@ import (
 	"github.com/containerd/continuity/fs"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/util/openfile"
 	"github.com/moby/buildkit/worker"
 	"github.com/moby/sys/user"
 	"github.com/pkg/errors"
@@ -29,7 +30,7 @@ func readUser(chopt *pb.ChownOpt, mu, mg snapshot.Mountable) (*copy.User, error)
 		switch u := chopt.User.User.(type) {
 		case *pb.UserOpt_ByName:
 			if mu == nil {
-				return nil, errors.Errorf("invalid missing user mount")
+				return nil, errors.New("invalid missing user mount")
 			}
 
 			lm := snapshot.LocalMounter(mu)
@@ -75,7 +76,7 @@ func readUser(chopt *pb.ChownOpt, mu, mg snapshot.Mountable) (*copy.User, error)
 		switch u := chopt.Group.User.(type) {
 		case *pb.UserOpt_ByName:
 			if mg == nil {
-				return nil, errors.Errorf("invalid missing group mount")
+				return nil, errors.New("invalid missing group mount")
 			}
 
 			lm := snapshot.LocalMounter(mg)
@@ -118,31 +119,30 @@ func readUser(chopt *pb.ChownOpt, mu, mg snapshot.Mountable) (*copy.User, error)
 	return &us, nil
 }
 
-func openUserFile(root, p string) (io.ReadCloser, error) {
-	p, err := fs.RootPath(root, p)
+func openUserFile(root, orig string) (_ io.ReadCloser, retErr error) {
+	// paths below are daemon-side locations, report the path as the build
+	// asked for it
+	defer func() {
+		var pathErr *os.PathError
+		if errors.As(retErr, &pathErr) {
+			pathErr.Path = orig
+		}
+	}()
+
+	p, err := fs.RootPath(root, orig)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	f, err := os.Open(p)
+	f, err := openfile.Regular(p)
 	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	info, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return nil, errors.WithStack(err)
-	}
-	if !info.Mode().IsRegular() {
-		f.Close()
-		return nil, errors.Errorf("%s is not a regular file", p)
+		return nil, err
 	}
 
 	return &limitedReadCloser{
 		ReadCloser: f,
 		r:          &io.LimitedReader{R: f, N: maxUserFileBytes + 1},
-		name:       p,
+		name:       orig,
 	}, nil
 }
 

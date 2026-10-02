@@ -162,7 +162,7 @@ func testAttestationBundle(t *testing.T, sb integration.Sandbox) {
 	}, "", frontend, nil)
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 
 	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
@@ -184,7 +184,7 @@ func testAttestationBundle(t *testing.T, sb integration.Sandbox) {
 
 		require.Equal(t, "https://example.com/attestations/v1.0", attest.PredicateType)
 		require.Equal(t, map[string]any{"foo": "1"}, attest.Predicate)
-		name := fmt.Sprintf("pkg:docker/%s/buildkit/testattestationsbundle@latest?platform=%s", url.QueryEscape(registry), url.QueryEscape(platforms.Format(ps[i])))
+		name := fmt.Sprintf("pkg:docker/%s/buildkit/testattestationsbundle@latest?platform=%s", registry, url.QueryEscape(platforms.Format(ps[i])))
 		subjects := []intoto.Subject{{
 			Name: name,
 			Digest: map[string]string{
@@ -301,7 +301,7 @@ func testAttestationDefaultSubject(t *testing.T, sb integration.Sandbox) {
 	}, "", frontend, nil)
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 
 	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
@@ -324,7 +324,7 @@ func testAttestationDefaultSubject(t *testing.T, sb integration.Sandbox) {
 		require.Equal(t, "https://example.com/attestations/v1.0", attest.PredicateType)
 		require.Equal(t, map[string]any{"success": true}, attest.Predicate)
 
-		name := fmt.Sprintf("pkg:docker/%s/buildkit/testattestationsemptysubject@latest?platform=%s", url.QueryEscape(registry), url.QueryEscape(platforms.Format(ps[i])))
+		name := fmt.Sprintf("pkg:docker/%s/buildkit/testattestationsemptysubject@latest?platform=%s", registry, url.QueryEscape(platforms.Format(ps[i])))
 		subjects := []intoto.Subject{{
 			Name: name,
 			Digest: map[string]string{
@@ -439,7 +439,7 @@ func testExportAnnotations(t *testing.T, sb integration.Sandbox) {
 	}, "", frontend, nil)
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
 	require.NoError(t, err)
@@ -634,7 +634,7 @@ func testExportAnnotationsMediaTypes(t *testing.T, sb integration.Sandbox) {
 	}, "", frontend, nil)
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
 	require.NoError(t, err)
@@ -655,7 +655,7 @@ func testExportAnnotationsMediaTypes(t *testing.T, sb integration.Sandbox) {
 	}, "", frontend, nil)
 	require.NoError(t, err)
 
-	desc, provider, err = contentutil.ProviderFromRef(target2)
+	desc, provider, err = contentutil.ProviderFromRef(sb.Context(), target2)
 	require.NoError(t, err)
 	imgs2, err := testutil.ReadImages(sb.Context(), provider, desc)
 	require.NoError(t, err)
@@ -801,7 +801,7 @@ func testExportAttestations(t *testing.T, sb integration.Sandbox, ociArtifact bo
 		}, "", frontend, nil)
 		require.NoError(t, err)
 
-		desc, provider, err := contentutil.ProviderFromRef(targets[0])
+		desc, provider, err := contentutil.ProviderFromRef(sb.Context(), targets[0])
 		require.NoError(t, err)
 
 		imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
@@ -860,7 +860,7 @@ func testExportAttestations(t *testing.T, sb integration.Sandbox, ociArtifact bo
 				if tagged, ok := named.(reference.Tagged); ok {
 					version = tagged.Tag()
 				}
-				p := fmt.Sprintf("pkg:docker/%s%s@%s?platform=%s", url.QueryEscape(registry), strings.TrimPrefix(name, registry), version, url.PathEscape(platforms.Format(ps[i])))
+				p := fmt.Sprintf("pkg:docker/%s%s@%s?platform=%s", registry, strings.TrimPrefix(name, registry), version, url.PathEscape(platforms.Format(ps[i])))
 				purls[k] = p
 			}
 
@@ -1414,7 +1414,7 @@ EOF
 	}, "", makeTargetFrontend(false), nil)
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 
 	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
@@ -1439,7 +1439,7 @@ EOF
 	}, "", makeTargetFrontend(true), nil)
 	require.NoError(t, err)
 
-	desc, provider, err = contentutil.ProviderFromRef(target)
+	desc, provider, err = contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 
 	imgs, err = testutil.ReadImages(sb.Context(), provider, desc)
@@ -1471,7 +1471,7 @@ EOF
 	}, "", makeTargetFrontend(false), nil)
 	require.NoError(t, err)
 
-	desc, provider, err = contentutil.ProviderFromRef(target)
+	desc, provider, err = contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 
 	imgs, err = testutil.ReadImages(sb.Context(), provider, desc)
@@ -1503,7 +1503,7 @@ EOF
 	}, "", makeTargetFrontend(true), nil)
 	require.NoError(t, err)
 
-	desc, provider, err = contentutil.ProviderFromRef(target)
+	desc, provider, err = contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 
 	imgs, err = testutil.ReadImages(sb.Context(), provider, desc)
@@ -1535,7 +1535,7 @@ EOF
 	}, "", makeTargetFrontend(false), nil)
 	require.NoError(t, err)
 
-	desc, provider, err = contentutil.ProviderFromRef(target)
+	desc, provider, err = contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 
 	imgs, err = testutil.ReadImages(sb.Context(), provider, desc)
@@ -1569,7 +1569,7 @@ EOF
 	}, "", makeTargetFrontend(false), nil)
 	require.NoError(t, err)
 
-	desc, provider, err = contentutil.ProviderFromRef(target)
+	desc, provider, err = contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 
 	imgs, err = testutil.ReadImages(sb.Context(), provider, desc)
@@ -1726,7 +1726,7 @@ EOF
 	}, "", targetFrontend, nil)
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 
 	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
@@ -1880,7 +1880,7 @@ func testSBOMSupplements(t *testing.T, sb integration.Sandbox) {
 	}, "", frontend, nil)
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 
 	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
@@ -1935,9 +1935,7 @@ func testSourceDateEpochClamp(t *testing.T, sb integration.Sandbox) {
 	def, err := busybox.Marshal(sb.Context())
 	require.NoError(t, err)
 
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
+	destDir := t.TempDir()
 
 	out := filepath.Join(destDir, "out.tar")
 	outW, err := os.Create(out)
@@ -2120,9 +2118,7 @@ func testSourceDateEpochLayerTimestamps(t *testing.T, sb integration.Sandbox) {
 	def, err := st.Marshal(sb.Context())
 	require.NoError(t, err)
 
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
+	destDir := t.TempDir()
 
 	out := filepath.Join(destDir, "out.tar")
 	outW, err := os.Create(out)
@@ -2180,9 +2176,7 @@ func testSourceDateEpochLocalExporter(t *testing.T, sb integration.Sandbox) {
 	def, err := st.Marshal(sb.Context())
 	require.NoError(t, err)
 
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
+	destDir := t.TempDir()
 
 	tm := time.Date(2015, time.October, 21, 7, 28, 0, 0, time.UTC)
 
@@ -2231,9 +2225,7 @@ func testSourceDateEpochReset(t *testing.T, sb integration.Sandbox) {
 	def, err := st.Marshal(sb.Context())
 	require.NoError(t, err)
 
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
+	destDir := t.TempDir()
 
 	out := filepath.Join(destDir, "out.tar")
 	outW, err := os.Create(out)
@@ -2295,9 +2287,7 @@ func testSourceDateEpochTarExporter(t *testing.T, sb integration.Sandbox) {
 	def, err := st.Marshal(sb.Context())
 	require.NoError(t, err)
 
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
+	destDir := t.TempDir()
 
 	out := filepath.Join(destDir, "out.tar")
 	outW, err := os.Create(out)
