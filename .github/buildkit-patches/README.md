@@ -9,8 +9,9 @@ Upstream tags are kept immutable. A successfully patched upstream tag such as
 `v0.32.0` is published as `v0.32.0-runs-on.1` in Git and in public ECR.
 
 `sync-after-tag` marks the last upstream tag handled when this automation was
-introduced. The workflow considers every subsequently created upstream `v*`
-tag, including patch releases made from older release branches.
+introduced. The workflow considers every subsequently created final upstream
+release tag (`vX.Y.Z`), including patch releases made from older release
+branches. Release candidates are skipped.
 
 When a new upstream release line needs a rebase:
 
