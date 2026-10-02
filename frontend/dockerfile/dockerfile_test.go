@@ -59,6 +59,7 @@ var allTests = integration.TestFuncs(
 
 	// dockerfile_cache_test.go
 	testCacheReleased,
+	testMissingCopySourceReleasesCache,
 	testExportCacheLoop,
 	testCacheMultiPlatformImportExport,
 	testImageManifestCacheImportExport,
@@ -111,6 +112,7 @@ var allTests = integration.TestFuncs(
 	testCopyWildcards,
 	testCopyRelative,
 	testCopyUnicodePath,
+	testLocalUnicodeSharedKey,
 	testLocalCustomSessionID,
 
 	// dockerfile_core_test.go
@@ -132,6 +134,9 @@ var allTests = integration.TestFuncs(
 	testDockerignore,
 	testDockerignoreInvalid,
 	testDockerignoreOverride,
+
+	// dockerfile_filesize_test.go
+	testDockerfileTooLarge,
 
 	// dockerfile_export_test.go
 	testTarExporterBasic,
@@ -371,7 +376,7 @@ func ensurePruneAll(t *testing.T, c *client.Client, sb integration.Sandbox) {
 		}
 		t.Logf("retrying prune(%d)", i)
 	}
-	t.Fatalf("failed to ensure prune")
+	t.Fatal("failed to ensure prune")
 }
 
 func newContainerd(cdAddress string) (*ctd.Client, error) {

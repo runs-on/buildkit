@@ -325,6 +325,26 @@ COPY --from=builder /usr/src/app/testresult.xml .
 buildctl build ... --opt target=testresult --output type=local,dest=path/to/output-dir
 ```
 
+Alternatively, `src=<path>` exports only part of the build result, without
+needing a dedicated stage:
+
+```bash
+buildctl build ... --output type=local,dest=path/to/output-dir,src=/usr/src/app/reports
+```
+
+The contents of `src` are written to the root of the destination, so
+`src=/usr/src/app/reports` exports `reports/index.html` as `index.html`. Omit
+`src` to export the entire filesystem.
+
+`src` must point to a directory, and is always resolved from the root of the
+build result, so `src=app/build` and `src=/app/build` are equivalent. Symlinks
+are resolved within the build result: a link pointing at `/etc` refers to `/etc`
+inside the result, never on the host running BuildKit. With a multi-platform
+build, `src` is applied to each platform.
+
+Use a BuildKit daemon that supports `src`. Older daemons ignore unknown exporter
+options and may export the entire build result instead.
+
 With a [multi-platform build](docs/multi-platform.md), a subfolder matching
 each target platform will be created in the destination directory:
 
@@ -379,10 +399,12 @@ buildctl build ... --output type=local,dest=./bin/release,mode=delete
 ```
 
 Tar exporter is similar to local exporter but transfers the files through a tarball.
+It supports `src=<path>` with the same meaning as above.
 
 ```bash
 buildctl build ... --output type=tar,dest=out.tar
 buildctl build ... --output type=tar > out.tar
+buildctl build ... --output type=tar,dest=reports.tar,src=/usr/src/app/reports
 ```
 
 #### Docker tarball
@@ -506,7 +528,7 @@ The directory layout conforms to OCI Image Spec v1.0.
 * `compression-level=<value>`: compression level for gzip, estargz (0-9) and zstd (0-22)
 * `force-compression=true`: forcibly apply `compression` option to all layers
 * `ignore-error=<false|true>`: specify if error is ignored in case cache export fails (default: `false`)
-* `reset=<true|false>`: remove any blobs in the cache directory that are not referenced by the current manifests in `index.json` (default: `false`). This is useful for keeping the local cache directory from growing indefinitely.
+* `reset=<true|false>`: remove any blobs in the cache directory that are not referenced by the current manifests in `index.json` (default: `false`). This is useful for keeping the local cache directory from growing indefinitely. Cleanup is skipped when the store is busy.
 
 `--import-cache` options:
 * `type=local`
@@ -596,6 +618,9 @@ Beware, these configurations must be available at buildkit daemon level, not at 
 * `ignore-error=<false|true>`: specify if error is ignored in case cache export fails (default: `false`)
 * `touch_refresh=24h`: Instead of being uploaded again when not changed, blobs files will be "touched" on s3 every `touch_refresh`, default is 24h. Due to this, an expiration policy can be set on the S3 bucket to cleanup useless files automatically. Manifests files are systematically rewritten, there is no need to touch them.
 * `upload_parallelism=4`: This parameter changes the number of layers uploaded to s3 in parallel. Each individual layer is uploaded with 5 threads, using the Upload manager provided by the AWS SDK.
+* `compression=<uncompressed|gzip|estargz|zstd>`: choose compression type for layers newly created and cached, gzip is default value. `estargz` layers are recorded as plain `gzip` layers in the s3 cache manifest (their eStargz annotations are not preserved), so they cannot be lazily pulled from s3
+* `compression-level=<value>`: compression level for gzip, estargz (0-9) and zstd (0-22)
+* `force-compression=true`: forcibly apply `compression` option to all layers
 * `retry_mode=<standard|adaptive>`: sets the AWS SDK retry mode (default: `standard`). `standard` uses exponential backoff, `adaptive` adds client-side rate limiting. See [AWS retry documentation](https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html).
 * `retry_max_attempts=<int>`: sets the maximum number of attempts for each S3 request, including the initial request and all retries (default: 3). Must be a positive integer.
 
@@ -808,20 +833,37 @@ docker run \
 ## OpenTelemetry support
 
 BuildKit supports [OpenTelemetry](https://opentelemetry.io/) for buildkitd gRPC
-API and buildctl commands. To capture the trace to
-[Jaeger](https://github.com/jaegertracing/jaeger), set `JAEGER_TRACE`
-environment variable to the collection address.
+API and buildctl commands. BuildKit can export traces from `buildkitd` with the
+[OpenTelemetry Protocol (OTLP)](https://opentelemetry.io/docs/specs/otlp/).
+`buildctl` forwards its spans to `buildkitd`, so the exporter only needs to be
+configured for the daemon.
+
+For example, start a Jaeger all-in-one collector with its OTLP gRPC endpoint and
+web interface exposed:
 
 ```bash
-docker run -d -p6831:6831/udp -p16686:16686 jaegertracing/all-in-one:latest
-export JAEGER_TRACE=0.0.0.0:6831
-# restart buildkitd and buildctl so they know JAEGER_TRACE
-# any buildctl command should be traced to http://127.0.0.1:16686/
+docker run -d -p4317:4317 -p16686:16686 jaegertracing/all-in-one:latest
 ```
 
-> On Windows, if you are running Jaeger outside of a container, [`jaeger-all-in-one.exe`](https://www.jaegertracing.io/docs/1.57/getting-started/#all-in-one),
-> set the environment variable `setx -m JAEGER_TRACE "0.0.0.0:6831"`,
-> restart `buildkitd` in a new terminal and the traces will be collected automatically.
+Configure the OTLP exporter in the environment used to start `buildkitd`:
+
+```bash
+export OTEL_TRACES_EXPORTER=otlp
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4317
+# start or restart buildkitd from this environment
+```
+
+The endpoint is resolved from the network namespace where `buildkitd` runs. If
+the daemon runs in a container or on another host, replace `127.0.0.1` with an
+address that it can reach. After running a `buildctl` command, view its traces in
+the [Jaeger UI](http://127.0.0.1:16686/). Any OTLP-compatible collector or
+backend can be used instead of Jaeger.
+
+The example uses OTLP over gRPC, BuildKit's default OTLP transport. For endpoint,
+TLS, and authentication settings supported by the OTLP gRPC exporter, see the
+[OpenTelemetry Go exporter documentation](https://pkg.go.dev/go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc).
+BuildKit handles exporter selection separately and does not support every value
+defined by the general OpenTelemetry SDK environment-variable specification.
 
 ## Running BuildKit without root privileges
 

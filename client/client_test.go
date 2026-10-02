@@ -30,14 +30,18 @@ var allTests = []func(t *testing.T, sb integration.Sandbox){
 	testLocalCacheExportReset,
 	testMultipleCacheExports,
 	testMultipleRecordsWithSameLayersCacheImportExport,
+	testRemoteCacheSharedMergeBranches,
 	testMultipleRegistryCacheImportExport,
+	testRegistryCacheImportSessionRebind,
 	testRegistryEmptyCacheExport,
 	testSnapshotWithMultipleBlobs,
 	testUncompressedLocalCacheImportExport,
 	testUncompressedRegistryCacheImportExport,
+	testUncompressedS3CacheImportExport,
 	testZstdLocalCacheExport,
 	testZstdLocalCacheImportExport,
 	testZstdRegistryCacheImportExport,
+	testZstdS3CacheImportExport,
 	testStargzLazyInlineCacheImportExport,
 	testStargzLazyRegistryCacheImportExport,
 
@@ -63,6 +67,7 @@ var allTests = []func(t *testing.T, sb integration.Sandbox){
 
 	// client_export_image_test.go
 	testBuildExportScratch,
+	testBuildExportUnpackWithRewriteTimestamp,
 	testBuildExportWithForeignLayer,
 	testBuildExportWithUncompressed,
 	testBuildExportZstd,
@@ -88,6 +93,13 @@ var allTests = []func(t *testing.T, sb integration.Sandbox){
 	testExportLocalModeDeleteMultiPlatformKeepsAllPlatforms,
 	testExportLocalNoPlatformSplit,
 	testExportLocalNoPlatformSplitOverwrite,
+	testExportLocalSource,
+	testExportLocalSourceModeDelete,
+	testExportLocalSourceNotFound,
+	testExportLocalSourceMultiPlatform,
+	testExportLocalSourceNoPlatformSplit,
+	testExportTarSource,
+	testExportTarPlatformIDSanitized,
 	testExporterTargetExists,
 	testMultipleExporters,
 	testSessionExporter,
@@ -162,11 +174,13 @@ var allTests = []func(t *testing.T, sb integration.Sandbox){
 
 	// client_image_source_test.go
 	testClientGatewayCanceledCredentialsCallbackReturns,
+	testBuildWithInvalidChainID,
 	testPullWithLayerLimit,
 	testValidateDigestOrigin,
 
 	// client_local_source_test.go
 	testLocalSourceDiffer,
+	testLocalSourceFilterOpt,
 	testLocalSourceWithHardlinksFilter,
 	testLocalSymlinkEscape,
 	testMetadataOnlyLocal,
@@ -187,6 +201,7 @@ var allTests = []func(t *testing.T, sb integration.Sandbox){
 	testLLBMountPerformance,
 	testLockedCacheMounts,
 	testMountStubsDirectory,
+	testMountStubsRuntimeMountpoints,
 	testMountStubsTimestamp,
 	testMountWithNoSource,
 	testRawSocketMount,
@@ -262,6 +277,7 @@ func TestClientGatewayIntegration(t *testing.T) {
 
 		// gateway_container_mount_test.go
 		testClientGatewayContainerMounts,
+		testClientGatewayContainerReadFileSpecial,
 		testClientGatewayContainerPlatformPATH,
 		testClientGatewayContainerSecretEnv,
 
@@ -319,6 +335,12 @@ func testIntegration(t *testing.T, funcs ...func(t *testing.T, sb integration.Sa
 	tests = append(tests, diffOpTestCases()...)
 	integration.Run(t, tests, mirrors)
 
+	integration.Run(t, integration.TestFuncs(
+		testBuildHistoryDisabled,
+	), mirrors, integration.WithMatrix("history", map[string]any{
+		"disabled": &historyDisabled{},
+	}))
+
 	// the rest of the tests are meant for non-Windows, skipping on Windows.
 	integration.SkipOnPlatform(t, "windows")
 
@@ -349,6 +371,7 @@ func testIntegration(t *testing.T, funcs ...func(t *testing.T, sb integration.Sa
 	integration.Run(t, integration.TestFuncs(
 		// policy_test.go
 		testProxyNetworkNoRootless,
+		testProxyNetworkGatewayExecEnvNoRootless,
 		testProxyNetworkModesNoRootless,
 		testProxyNetworkDefaultEgressNoRootless,
 	),

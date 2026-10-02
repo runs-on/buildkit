@@ -107,8 +107,9 @@ func (gs *Source) Identifier(scheme, ref string, attrs map[string]string, platfo
 				id.KeepGitDir = true
 			}
 		case pb.AttrFullRemoteURL:
-			if !gitutil.IsGitTransport(v) {
-				v = "https://" + v
+			v, err = validateFullRemoteURL(id.Remote, v)
+			if err != nil {
+				return nil, err
 			}
 			id.Remote = v
 		case pb.AttrAuthHeaderSecret:
@@ -147,6 +148,8 @@ func (gs *Source) Identifier(scheme, ref string, attrs map[string]string, platfo
 			id.VerifySignature.IgnoreSignedTag = v == "true"
 		case pb.AttrGitMTime:
 			id.MTime = v
+		case pb.AttrGitAdvice:
+			id.Advice = v == "true"
 		case pb.AttrGitFetchByCommit:
 			id.FetchByCommit = v == "true"
 		case pb.AttrGitBundle:
@@ -170,7 +173,7 @@ func (gs *Source) Identifier(scheme, ref string, attrs map[string]string, platfo
 }
 
 // needs to be called with repo lock
-func (gs *Source) mountRemote(ctx context.Context, remote string, authArgs []string, sha256 bool, reset bool, g session.Group) (target string, release func() error, retErr error) {
+func (gs *Source) mountRemote(ctx context.Context, remote string, authArgs []string, gitAdvice bool, sha256 bool, reset bool, g session.Group) (target string, release func() error, retErr error) {
 	sis, err := searchGitRemote(ctx, gs.cache, remote)
 	if err != nil {
 		return "", nil, errors.Wrapf(err, "failed to search metadata for %s", urlutil.RedactCredentials(remote))
@@ -233,6 +236,7 @@ func (gs *Source) mountRemote(ctx context.Context, remote string, authArgs []str
 	}()
 
 	git := gitCLI(
+		gitutil.WithGitAdvice(gitAdvice),
 		gitutil.WithGitDir(dir),
 		gitutil.WithArgs(authArgs...),
 	)
@@ -971,7 +975,7 @@ func (gs *gitSourceHandler) tryRemoteFetch(ctx context.Context, jobCtx solver.Jo
 		}
 	}
 
-	gitDir, unmountGitDir, err := gs.mountRemote(ctx, gs.src.Remote, authArgs, gs.sha256, reset, g)
+	gitDir, unmountGitDir, err := gs.mountRemote(ctx, gs.src.Remote, authArgs, gs.src.Advice, gs.sha256, reset, g)
 	if err != nil {
 		return nil, err
 	}
@@ -1341,7 +1345,7 @@ func (gs *gitSourceHandler) checkout(ctx context.Context, repo *gitRepo, g sessi
 	}
 
 	if gs.src.MTime == "commit" {
-		commitTime, err := getCommitTime(ctx, git, refOrCommit)
+		commitTime, err := getCommitTime(ctx, repo.GitCLI, refOrCommit)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to get commit time for %s", urlutil.RedactCredentials(gs.src.Remote))
 		}
@@ -1528,6 +1532,7 @@ func (gs *gitSourceHandler) emptyGitCli(ctx context.Context, g session.Group, op
 	}
 
 	opts = append([]gitutil.Option{
+		gitutil.WithGitAdvice(gs.src.Advice),
 		gitutil.WithArgs(gs.authArgs...),
 		gitutil.WithSSHAuthSock(sock),
 		gitutil.WithSSHKnownHosts(knownHosts),
