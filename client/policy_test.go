@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/sha256"
@@ -34,6 +35,7 @@ import (
 	sourcepolicypb "github.com/moby/buildkit/sourcepolicy/pb"
 	"github.com/moby/buildkit/sourcepolicy/policysession"
 	"github.com/moby/buildkit/util/entitlements"
+	"github.com/moby/buildkit/util/iohelper"
 	"github.com/moby/buildkit/util/pgpsign"
 	"github.com/moby/buildkit/util/testutil/integration"
 	"github.com/moby/buildkit/util/testutil/workers"
@@ -95,6 +97,47 @@ func testProxyNetworkNoRootless(t *testing.T, sb integration.Sandbox) {
 	}, nil)
 	require.NoError(t, err)
 	require.Equal(t, int32(0), leakHit.Load())
+
+	cleanupDestDir := t.TempDir()
+	cleanupFailure := llb.Image("alpine:latest").
+		Run(
+			llb.Shlex(
+				`sh -c 'touch /exec-completed && dd if=/dev/zero bs=1048576 count=11 >> /etc/ssl/certs/ca-certificates.crt 2>/dev/null'`,
+			),
+			llb.IgnoreCache,
+		).
+		Root()
+	def, err = cleanupFailure.Marshal(ctx)
+	require.NoError(t, err)
+	_, err = c.Solve(ctx, def, SolveOpt{
+		ProxyNetwork: true,
+		Exports: []ExportEntry{{
+			Type:      ExporterLocal,
+			OutputDir: cleanupDestDir,
+		}},
+	}, nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "failed to clean up proxy CA")
+	require.ErrorContains(t, err, "exceeds 10485760 bytes")
+	require.NoFileExists(t, filepath.Join(cleanupDestDir, "exec-completed"))
+
+	processAndCleanupFailure := llb.Image("alpine:latest").
+		Run(
+			llb.Shlex(
+				`sh -c 'dd if=/dev/zero bs=1048576 count=11 >> /etc/ssl/certs/ca-certificates.crt 2>/dev/null && exit 42'`,
+			),
+			llb.IgnoreCache,
+		).
+		Root()
+	def, err = processAndCleanupFailure.Marshal(ctx)
+	require.NoError(t, err)
+	_, err = c.Solve(ctx, def, SolveOpt{
+		ProxyNetwork: true,
+	}, nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "exit code: 42")
+	require.ErrorContains(t, err, "failed to clean up proxy CA")
+	require.ErrorContains(t, err, "exceeds 10485760 bytes")
 
 	var checked atomic.Int32
 	denyProvider := policysession.NewPolicyProvider(func(ctx context.Context, req *policysession.CheckPolicyRequest) (*policysession.DecisionResponse, *pb.ResolveSourceMetaRequest, error) {
@@ -251,6 +294,87 @@ func testProxyNetworkNoRootless(t *testing.T, sb integration.Sandbox) {
 	require.Len(t, materialsErr.Incomplete, 1)
 	require.Equal(t, httpURL+"/missing", materialsErr.Incomplete[0].Uri)
 	require.Equal(t, "unsuccessful_response", materialsErr.Incomplete[0].Reason)
+}
+
+func testProxyNetworkGatewayExecEnvNoRootless(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+
+	ctx := sb.Context()
+	c, err := New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+	childEnv := bytes.NewBuffer(nil)
+
+	_, err = c.Build(ctx, SolveOpt{ProxyNetwork: true}, "proxy-network-gateway-exec-env", func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		def, err := llb.Image("busybox:latest").Marshal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		res, err := c.Solve(ctx, gateway.SolveRequest{Definition: def.ToPB()})
+		if err != nil {
+			return nil, err
+		}
+		ctr, err := c.NewContainer(ctx, gateway.NewContainerRequest{
+			Mounts: []gateway.Mount{{
+				Dest:      "/",
+				MountType: opspb.MountType_BIND,
+				Ref:       res.Ref,
+			}},
+		})
+		if err != nil {
+			return nil, err
+		}
+		pid1, err := ctr.Start(ctx, gateway.StartRequest{
+			Args: []string{"sleep", "30"},
+			Env: []string{
+				"INIT_ONLY=must-not-leak",
+				"ALL_PROXY=http://initial-process-proxy.invalid",
+			},
+		})
+		if err != nil {
+			_ = ctr.Release(context.WithoutCancel(ctx))
+			return nil, err
+		}
+		defer func() {
+			_ = ctr.Release(context.WithoutCancel(ctx))
+			_ = pid1.Wait()
+		}()
+
+		pid2, err := ctr.Start(ctx, gateway.StartRequest{
+			Args: []string{"env"},
+			Env: []string{
+				"CHILD_ENV=preserved",
+				"ALL_PROXY=http://child-process-proxy.invalid",
+			},
+			Stdout: &iohelper.NopWriteCloser{Writer: childEnv},
+		})
+		if err != nil {
+			return nil, err
+		}
+		if err := pid2.Wait(); err != nil {
+			return nil, err
+		}
+		return &gateway.Result{}, nil
+	}, nil)
+	require.NoError(t, err)
+
+	env := strings.Split(strings.TrimSpace(childEnv.String()), "\n")
+	require.Contains(t, env, "CHILD_ENV=preserved")
+	require.NotContains(t, env, "ALL_PROXY=http://child-process-proxy.invalid")
+	require.NotContains(t, env, "ALL_PROXY=http://initial-process-proxy.invalid")
+	require.NotContains(t, env, "INIT_ONLY=must-not-leak")
+	values := make(map[string]string, len(env))
+	for _, entry := range env {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok {
+			values[name] = value
+		}
+	}
+	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy"} {
+		require.NotEmptyf(t, values[name], "%s is not set in the gateway exec environment:\n%s", name, childEnv.String())
+	}
+	require.Equal(t, values["HTTP_PROXY"], values["ALL_PROXY"])
+	require.Equal(t, values["http_proxy"], values["all_proxy"])
 }
 
 func testProxyNetworkModesNoRootless(t *testing.T, sb integration.Sandbox) {
@@ -578,6 +702,29 @@ func testSourcePolicySession(t *testing.T, sb integration.Sandbox) {
 				},
 			},
 			expectedError: "policy denied",
+		},
+		{
+			name: "deny git bundle",
+			state: func() llb.State {
+				return llb.Git(
+					"https://example.com/repo.git",
+					"",
+					llb.GitChecksum("1111111111111111111111111111111111111111"),
+					llb.GitBundleURL("oci-layout+blob://local/git-bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+				)
+			},
+			callbacks: []policysession.PolicyCallback{
+				func(ctx context.Context, req *policysession.CheckPolicyRequest) (*policysession.DecisionResponse, *pb.ResolveSourceMetaRequest, error) {
+					require.Equal(t, "git://example.com/repo.git", req.Source.Source.Identifier)
+					return &policysession.DecisionResponse{Action: sourcepolicypb.PolicyAction_ALLOW}, nil, nil
+				},
+				func(ctx context.Context, req *policysession.CheckPolicyRequest) (*policysession.DecisionResponse, *pb.ResolveSourceMetaRequest, error) {
+					require.Equal(t, "oci-layout+blob://local/git-bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", req.Source.Source.Identifier)
+					require.Equal(t, "local/git-bundle", req.Source.Source.Attrs[opspb.AttrOCILayoutStoreID])
+					return &policysession.DecisionResponse{Action: sourcepolicypb.PolicyAction_DENY}, nil, nil
+				},
+			},
+			expectedError: "not allowed by policy",
 		},
 		{
 			name:  "alpine with digest policy",
@@ -1711,6 +1858,50 @@ func testSourcePolicy(t *testing.T, sb integration.Sandbox) {
 			},
 		}, "", frontend, nil)
 		require.ErrorContains(t, err, sourcepolicy.ErrSourceDenied.Error())
+	})
+
+	t.Run("deny git bundle source", func(t *testing.T) {
+		const checksum = "1111111111111111111111111111111111111111"
+		bundles := []string{
+			"docker-image+blob://registry.example.com/buildkit/git-bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			"oci-layout+blob://local/git-bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		}
+		for _, bundle := range bundles {
+			scheme, _, _ := strings.Cut(bundle, "://")
+			t.Run(scheme, func(t *testing.T) {
+				frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+					st := llb.Git("https://example.com/repo.git", "", llb.GitChecksum(checksum), llb.GitBundleURL(bundle))
+					def, err := st.Marshal(sb.Context())
+					if err != nil {
+						return nil, err
+					}
+					return c.Solve(ctx, gateway.SolveRequest{Definition: def.ToPB()})
+				}
+
+				selector := &sourcepolicypb.Selector{
+					Identifier: bundle,
+					MatchType:  sourcepolicypb.MatchType_EXACT,
+				}
+				if scheme == "oci-layout+blob" {
+					selector.Constraints = []*sourcepolicypb.AttrConstraint{
+						{
+							Key:       opspb.AttrOCILayoutStoreID,
+							Value:     "local/git-bundle",
+							Condition: sourcepolicypb.AttrMatch_EQUAL,
+						},
+					}
+				}
+				_, err := c.Build(sb.Context(), SolveOpt{
+					SourcePolicy: &sourcepolicypb.Policy{Rules: []*sourcepolicypb.Rule{
+						{
+							Action:   sourcepolicypb.PolicyAction_DENY,
+							Selector: selector,
+						},
+					}},
+				}, "", frontend, nil)
+				require.ErrorContains(t, err, sourcepolicy.ErrSourceDenied.Error())
+			})
+		}
 	})
 
 	t.Run("Frontend policies", func(t *testing.T) {

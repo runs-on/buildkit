@@ -137,7 +137,7 @@ RUN echo ok> /foo
 				}, nil)
 				require.NoError(t, err)
 
-				desc, provider, err := contentutil.ProviderFromRef(target)
+				desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 				require.NoError(t, err)
 				imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
 				require.NoError(t, err)
@@ -261,6 +261,7 @@ RUN echo ok> /foo
 					require.True(t, pred.RunDetails.Metadata.StartedOn.Before(*pred.RunDetails.Metadata.FinishedOn))
 
 					require.Equal(t, platforms.Format(platforms.Normalize(platforms.DefaultSpec())), pred.BuildDefinition.InternalParameters.BuilderPlatform)
+					require.Equal(t, platforms.FormatAll(platforms.Normalize(platforms.DefaultSpec())), pred.BuildDefinition.InternalParameters.TargetPlatform)
 					if isClient || isGateway {
 						require.Empty(t, pred.BuildDefinition.InternalParameters.DockerfileVersion)
 					} else {
@@ -466,7 +467,7 @@ COPY myapp.Dockerfile /
 			)
 			require.NoError(t, err)
 
-			cmd := exec.CommandContext(context.TODO(), "git", "rev-parse", "v1")
+			cmd := exec.CommandContext(t.Context(), "git", "rev-parse", "v1")
 			cmd.Dir = dir.Name
 			expectedGitSHA, err := cmd.Output()
 			require.NoError(t, err)
@@ -499,7 +500,7 @@ COPY myapp.Dockerfile /
 			}, nil)
 			require.NoError(t, err)
 
-			desc, provider, err := contentutil.ProviderFromRef(target)
+			desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 			require.NoError(t, err)
 			imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
 			require.NoError(t, err)
@@ -701,7 +702,7 @@ RUN echo "ok-$TARGETARCH" > /foo
 	}, nil)
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(ctx, target)
 	require.NoError(t, err)
 	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
 	require.NoError(t, err)
@@ -912,7 +913,7 @@ func testClientFrontendProvenance(t *testing.T, sb integration.Sandbox) {
 	}, "", frontend, nil)
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
 	require.NoError(t, err)
@@ -1058,7 +1059,7 @@ COPY --from=base C:\out C:\Files
 	}, nil)
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 	imgs, err := testutil.ReadImages(ctx, provider, desc)
 	require.NoError(t, err)
@@ -1172,7 +1173,7 @@ func testClientLLBProvenance(t *testing.T, sb integration.Sandbox) {
 	}, "", frontend, nil)
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
 	require.NoError(t, err)
@@ -1753,7 +1754,7 @@ func solveProvenanceNamedTarget(ctx context.Context, c gateway.Client, f fronten
 	}
 	dt, ok := res.Metadata["containerimage.config"]
 	if !ok {
-		return llb.State{}, "", errors.Errorf("no containerimage.config in metadata")
+		return llb.State{}, "", errors.New("no containerimage.config in metadata")
 	}
 	dt, err = json.Marshal(map[string][]byte{
 		"containerimage.config": dt,
@@ -1794,7 +1795,7 @@ func solveProvenanceInputProducerWithInner(ctx context.Context, c gateway.Client
 	}
 	dt, ok := res.Metadata["containerimage.config"]
 	if !ok {
-		return llb.State{}, "", errors.Errorf("no containerimage.config in metadata")
+		return llb.State{}, "", errors.New("no containerimage.config in metadata")
 	}
 	dt, err = json.Marshal(map[string][]byte{
 		"containerimage.config": dt,
@@ -1869,7 +1870,7 @@ func assertFrontendRequest(t *testing.T, f frontendGateway, req *provenancetypes
 }
 
 func readNativeProvenancePredicate(ctx context.Context, t *testing.T, target string) provenancetypes.ProvenancePredicateSLSA1 {
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(ctx, target)
 	require.NoError(t, err)
 	imgs, err := testutil.ReadImages(ctx, provider, desc)
 	require.NoError(t, err)
@@ -1932,7 +1933,7 @@ RUN --mount=type=secret,id=mysecret --mount=type=secret,id=othersecret --mount=t
 	}, nil)
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
 	require.NoError(t, err)
@@ -2062,7 +2063,7 @@ EOF
 	}, nil)
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
 	require.NoError(t, err)
@@ -2334,7 +2335,7 @@ ADD bar bar`)
 	}, nil)
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
 	require.NoError(t, err)
@@ -2452,7 +2453,7 @@ COPY bar bar2
 
 		dt, ok := res.Metadata["containerimage.config"]
 		if !ok {
-			return nil, errors.Errorf("no containerimage.config in metadata")
+			return nil, errors.New("no containerimage.config in metadata")
 		}
 
 		dt, err = json.Marshal(map[string][]byte{
@@ -2628,7 +2629,7 @@ func testDuplicateLayersProvenance(t *testing.T, sb integration.Sandbox) {
 
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(sb.Context(), target)
 	require.NoError(t, err)
 	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
 	require.NoError(t, err)
@@ -2714,13 +2715,16 @@ COPY --from=base /out /
 	require.NoError(t, err)
 	require.NotEqual(t, 0, len(dt))
 
-	var pred provenancetypes.ProvenancePredicateSLSA1
-	require.NoError(t, json.Unmarshal(dt, &pred))
+	var stmt struct {
+		Predicate provenancetypes.ProvenancePredicateSLSA1 `json:"predicate"`
+	}
+	require.NoError(t, json.Unmarshal(dt, &stmt))
+	require.Equal(t, platforms.FormatAll(platforms.Normalize(platforms.DefaultSpec())), stmt.Predicate.BuildDefinition.InternalParameters.TargetPlatform)
 }
 
 /*
 testProvenanceExportLocalForceSplit verifies that the local exporter writes build output and a
-valid provenance.json (SLSA 0.2) into a platform-specific subdirectory (e.g., linux_amd64/)
+valid provenance.json (SLSA v1) into a platform-specific subdirectory (e.g., linux_amd64/)
 when platform-split is enabled.
 
 Skipped on Windows: same provenance generation issue as testProvenanceExportLocal — fs.go does
@@ -2782,13 +2786,16 @@ COPY --from=base /out /
 	require.NoError(t, err)
 	require.NotEqual(t, 0, len(dt))
 
-	var pred provenancetypes.ProvenancePredicateSLSA1
-	require.NoError(t, json.Unmarshal(dt, &pred))
+	var stmt struct {
+		Predicate provenancetypes.ProvenancePredicateSLSA1 `json:"predicate"`
+	}
+	require.NoError(t, json.Unmarshal(dt, &stmt))
+	require.Equal(t, platforms.FormatAll(platforms.Normalize(platforms.DefaultSpec())), stmt.Predicate.BuildDefinition.InternalParameters.TargetPlatform)
 }
 
 /*
 testProvenanceExportLocalMultiPlatform verifies that a multi-platform build (linux/amd64, linux/arm64)
-exported locally writes each platform's output and provenance.json (SLSA 0.2) into separate
+exported locally writes each platform's output and provenance.json (SLSA v1) into separate
 platform-specific subdirectories.
 
 Skipped on Windows: same provenance generation issue as testProvenanceExportLocal — fs.go does
@@ -2847,8 +2854,11 @@ COPY --from=base /out /
 		require.NoError(t, err)
 		require.NotEqual(t, 0, len(dt))
 
-		var pred provenancetypes.ProvenancePredicateSLSA1
-		require.NoError(t, json.Unmarshal(dt, &pred))
+		var stmt struct {
+			Predicate provenancetypes.ProvenancePredicateSLSA1 `json:"predicate"`
+		}
+		require.NoError(t, json.Unmarshal(dt, &stmt))
+		require.Equal(t, strings.ReplaceAll(platform, "_", "/"), stmt.Predicate.BuildDefinition.InternalParameters.TargetPlatform)
 	}
 }
 
@@ -2856,7 +2866,7 @@ COPY --from=base /out /
 testProvenanceExportLocalMultiPlatformNoSplit verifies that a multi-platform build (linux/amd64,
 linux/arm64) exported locally with platform-split disabled writes all platform outputs into a
 single directory, with per-platform provenance files (e.g., provenance.linux_amd64.json) each
-containing a valid SLSA 0.2 predicate.
+containing a valid SLSA v1 predicate.
 
 Skipped on Windows: same provenance generation issue as testProvenanceExportLocal — fs.go does
 not acquire SeBackupPrivilege, causing "Access is denied" on system-protected paths.
@@ -2918,8 +2928,11 @@ COPY --from=base /out /
 		require.NoError(t, err)
 		require.NotEqual(t, 0, len(dt))
 
-		var pred provenancetypes.ProvenancePredicateSLSA1
-		require.NoError(t, json.Unmarshal(dt, &pred))
+		var stmt struct {
+			Predicate provenancetypes.ProvenancePredicateSLSA1 `json:"predicate"`
+		}
+		require.NoError(t, json.Unmarshal(dt, &stmt))
+		require.Equal(t, "linux/"+arch, stmt.Predicate.BuildDefinition.InternalParameters.TargetPlatform)
 	}
 }
 

@@ -21,6 +21,8 @@ import (
 	"github.com/moby/buildkit/executor/runcexecutor"
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
+	"github.com/moby/buildkit/util/db/boltutil"
+	"github.com/moby/buildkit/util/db/compaction"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/network/netproviders"
 	"github.com/moby/buildkit/util/winlayers"
@@ -39,7 +41,7 @@ type SnapshotterFactory struct {
 }
 
 // NewWorkerOpt creates a WorkerOpt.
-func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, processMode oci.ProcessMode, labels map[string]string, idmap *user.IdentityMapping, nopt netproviders.Opt, dns *oci.DNSConfig, binary, apparmorProfile string, selinux bool, parallelismSem *semaphore.Weighted, traceSocket, defaultCgroupParent string, cdiManager *cdidevices.Manager) (base.WorkerOpt, error) {
+func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, processMode oci.ProcessMode, labels map[string]string, idmap *user.IdentityMapping, nopt netproviders.Opt, dns *oci.DNSConfig, binary, apparmorProfile string, selinux bool, parallelismSem *semaphore.Weighted, traceSocket, defaultCgroupParent string, cdiManager *cdidevices.Manager, policies ...compaction.Config) (base.WorkerOpt, error) {
 	var opt base.WorkerOpt
 	name := "runc-" + snFactory.Name
 	root = filepath.Join(root, name)
@@ -95,9 +97,10 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 		return opt, err
 	}
 
-	db, err := bolt.Open(filepath.Join(root, "containerdmeta.db"), 0644, &bolt.Options{
-		FreelistType: bolt.FreelistMapType,
-	})
+	db, err := boltutil.Open(filepath.Join(root, "containerdmeta.db"), 0644, &bolt.Options{
+		FreelistType:   bolt.FreelistMapType,
+		NoFreelistSync: true,
+	}, policies...)
 	if err != nil {
 		return opt, err
 	}
@@ -133,7 +136,7 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 
 	maps.Copy(xlabels, labels)
 
-	md, err := metadata.NewStore(filepath.Join(root, "metadata_v2.db"))
+	md, err := metadata.NewStore(filepath.Join(root, "metadata_v2.db"), policies...)
 	if err != nil {
 		return opt, err
 	}
@@ -143,6 +146,7 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 		Root:             root,
 		Labels:           xlabels,
 		MetadataStore:    md,
+		ContentMetadata:  db,
 		NetworkProviders: np,
 		ProxyProvider:    proxyProvider,
 		Executor:         exe,

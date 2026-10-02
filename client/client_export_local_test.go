@@ -11,10 +11,12 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/continuity/fs/fstest"
 	"github.com/containerd/platforms"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/client/llb"
@@ -443,6 +445,105 @@ func testExportLocalNoPlatformSplitOverwrite(t *testing.T, sb integration.Sandbo
 	require.ErrorContains(t, err, "when split option is disabled")
 }
 
+func testExportTarPlatformIDSanitized(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureOCIExporter, workers.FeatureMultiPlatform)
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	const platformID = `..\buildkit-outside`
+	platform := platforms.DefaultSpec()
+
+	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		st := llb.Scratch().File(
+			llb.Mkfile("payload.txt", 0600, []byte("payload")),
+		)
+
+		def, err := st.Marshal(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		r, err := c.Solve(ctx, gateway.SolveRequest{
+			Definition: def.ToPB(),
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		ref, err := r.SingleRef()
+		if err != nil {
+			return nil, err
+		}
+
+		res := gateway.NewResult()
+		res.AddRef(platformID, ref)
+
+		dt, err := json.Marshal(&exptypes.Platforms{
+			Platforms: []exptypes.Platform{{
+				ID:       platformID,
+				Platform: platform,
+			}},
+		})
+		if err != nil {
+			return nil, err
+		}
+		res.AddMeta(exptypes.ExporterPlatformsKey, dt)
+
+		return res, nil
+	}
+
+	outW := bytes.NewBuffer(nil)
+	_, err = c.Build(sb.Context(), SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:   ExporterTar,
+				Output: fixedWriteCloser(&iohelper.NopWriteCloser{Writer: outW}),
+			},
+		},
+	}, "", frontend, nil)
+	require.NoError(t, err)
+
+	m, err := testutil.ReadTarToMap(outW.Bytes(), false)
+	require.NoError(t, err)
+
+	for name := range m {
+		require.Falsef(t, strings.HasPrefix(name, "../") ||
+			strings.HasPrefix(name, `..\`) ||
+			strings.Contains(name, `/../`) ||
+			strings.Contains(name, `\..\`) ||
+			strings.Contains(name, `\`) ||
+			strings.Contains(name, ":"),
+			"tar exporter emitted unsafe platform path %q", name)
+	}
+
+	tarPaths := make([]string, 0, len(m))
+	for name := range m {
+		tarPaths = append(tarPaths, name)
+	}
+	sort.Strings(tarPaths)
+
+	const platformDir = ".._buildkit-outside"
+	payloadPath := ""
+	for name, item := range m {
+		// The tar can contain directory entries and unrelated files; this test
+		// only verifies that the payload is exported under the sanitized root.
+		if item.Header.Typeflag != tar.TypeReg {
+			continue
+		}
+		if !strings.HasPrefix(name, platformDir+"/") {
+			continue
+		}
+		if path.Base(name) != "payload.txt" {
+			continue
+		}
+		payloadPath = name
+		require.Equal(t, "payload", string(item.Data))
+		break
+	}
+	require.NotEmptyf(t, payloadPath, "expected payload under sanitized tar path %q in %v", platformDir, tarPaths)
+}
+
 func testExporterTargetExists(t *testing.T, sb integration.Sandbox) {
 	workers.CheckFeatureCompat(t, sb, workers.FeatureOCIExporter)
 	c, err := New(sb.Context(), sb.Address())
@@ -483,7 +584,7 @@ func testMultipleExporters(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 	defer c.Close()
 
-	def, err := llb.Scratch().File(llb.Mkfile("foo.txt", 0o755, nil)).Marshal(context.TODO())
+	def, err := llb.Scratch().File(llb.Mkfile("foo.txt", 0o755, nil)).Marshal(t.Context())
 	require.NoError(t, err)
 
 	destDir, destDir2 := t.TempDir(), t.TempDir()
@@ -605,7 +706,7 @@ func testMultipleExporters(t *testing.T, sb integration.Sandbox) {
 func testSessionExporter(t *testing.T, sb integration.Sandbox) {
 	integration.SkipOnPlatform(t, "windows", "This test passed locally on windows, but failed on github action")
 	workers.CheckFeatureCompat(t, sb, workers.FeatureOCIExporter, workers.FeatureOCILayout)
-	c, err := New(context.TODO(), sb.Address())
+	c, err := New(t.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
@@ -860,4 +961,214 @@ func testTarExporterWithSocketCopy(t *testing.T, sb integration.Sandbox) {
 
 	_, err = c.Solve(sb.Context(), def, SolveOpt{}, nil)
 	require.NoError(t, err)
+}
+
+// sourceTestState returns a state with a nested layout, so a src pointing at
+// "sub" can be told apart from the whole result.
+//
+//	top.txt
+//	sub/nested.txt
+//	sub/deeper/deep.txt
+func sourceTestState() llb.State {
+	return llb.Scratch().
+		File(llb.Mkfile("top.txt", 0600, []byte("top"))).
+		File(llb.Mkdir("sub", 0755)).
+		File(llb.Mkfile("sub/nested.txt", 0600, []byte("nested"))).
+		File(llb.Mkdir("sub/deeper", 0755)).
+		File(llb.Mkfile("sub/deeper/deep.txt", 0600, []byte("deep")))
+}
+
+func testExportLocalSource(t *testing.T, sb integration.Sandbox) {
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	def, err := sourceTestState().Marshal(sb.Context())
+	require.NoError(t, err)
+
+	destDir := t.TempDir()
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDir,
+				Attrs:     map[string]string{"src": "/sub"},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, fstest.CheckDirectoryEqualWithApplier(destDir, fstest.Apply(
+		fstest.CreateFile("nested.txt", []byte("nested"), 0600),
+		fstest.CreateDir("deeper", 0755),
+		fstest.CreateFile("deeper/deep.txt", []byte("deep"), 0600),
+	)))
+}
+
+func testExportLocalSourceModeDelete(t *testing.T, sb integration.Sandbox) {
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	def, err := sourceTestState().Marshal(sb.Context())
+	require.NoError(t, err)
+
+	destDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(destDir, "stale.txt"), []byte("stale"), 0600))
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{{
+			Type:      ExporterLocal,
+			OutputDir: destDir,
+			Attrs:     map[string]string{"src": "/sub", "mode": "delete"},
+		}},
+	}, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, fstest.CheckDirectoryEqualWithApplier(destDir, fstest.Apply(
+		fstest.CreateFile("nested.txt", []byte("nested"), 0600),
+		fstest.CreateDir("deeper", 0755),
+		fstest.CreateFile("deeper/deep.txt", []byte("deep"), 0600),
+	)))
+}
+
+func testExportLocalSourceNotFound(t *testing.T, sb integration.Sandbox) {
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	def, err := sourceTestState().Marshal(sb.Context())
+	require.NoError(t, err)
+
+	destDir := t.TempDir()
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDir,
+				Attrs:     map[string]string{"src": "/nope"},
+			},
+		},
+	}, nil)
+	require.ErrorContains(t, err, "src=/nope:")
+	// the mountpoint of the ref inside the daemon must never reach the client
+	require.NotContains(t, err.Error(), "buildkit-mount")
+}
+
+func testExportLocalSourceMultiPlatform(t *testing.T, sb integration.Sandbox) {
+	testExportLocalSourceMultiPlatformSplit(t, sb, true)
+}
+
+func testExportLocalSourceNoPlatformSplit(t *testing.T, sb integration.Sandbox) {
+	testExportLocalSourceMultiPlatformSplit(t, sb, false)
+}
+
+func testExportLocalSourceMultiPlatformSplit(t *testing.T, sb integration.Sandbox, split bool) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureMultiPlatform)
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	platformsToTest := []string{"linux/amd64", "linux/arm64"}
+
+	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		res := gateway.NewResult()
+		expPlatforms := &exptypes.Platforms{
+			Platforms: make([]exptypes.Platform, len(platformsToTest)),
+		}
+		for i, platform := range platformsToTest {
+			name := strings.ReplaceAll(platform, "/", "_") + ".txt"
+			st := llb.Scratch().
+				File(llb.Mkfile("top.txt", 0600, []byte("top"))).
+				File(llb.Mkdir("sub", 0755)).
+				File(llb.Mkfile("sub/"+name, 0600, []byte(platform)))
+
+			def, err := st.Marshal(ctx)
+			if err != nil {
+				return nil, err
+			}
+			r, err := c.Solve(ctx, gateway.SolveRequest{Definition: def.ToPB()})
+			if err != nil {
+				return nil, err
+			}
+			ref, err := r.SingleRef()
+			if err != nil {
+				return nil, err
+			}
+			res.AddRef(platform, ref)
+			expPlatforms.Platforms[i] = exptypes.Platform{
+				ID:       platform,
+				Platform: platforms.MustParse(platform),
+			}
+		}
+		dt, err := json.Marshal(expPlatforms)
+		if err != nil {
+			return nil, err
+		}
+		res.AddMeta(exptypes.ExporterPlatformsKey, dt)
+		return res, nil
+	}
+
+	destDir := t.TempDir()
+	_, err = c.Build(sb.Context(), SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDir,
+				Attrs:     map[string]string{"src": "/sub", "platform-split": fmt.Sprint(split)},
+			},
+		},
+	}, "", frontend, nil)
+	require.NoError(t, err)
+
+	for _, platform := range platformsToTest {
+		name := strings.ReplaceAll(platform, "/", "_") + ".txt"
+		outputDir := destDir
+		if split {
+			outputDir = filepath.Join(destDir, strings.ReplaceAll(platform, "/", "_"))
+			require.NoError(t, fstest.CheckDirectoryEqualWithApplier(outputDir, fstest.Apply(
+				fstest.CreateFile(name, []byte(platform), 0600),
+			)), "unexpected content for %s", platform)
+			continue
+		}
+		dt, err := os.ReadFile(filepath.Join(outputDir, name))
+		require.NoError(t, err)
+		require.Equal(t, platform, string(dt))
+	}
+	entries, err := os.ReadDir(destDir)
+	require.NoError(t, err)
+	require.Len(t, entries, len(platformsToTest))
+}
+
+func testExportTarSource(t *testing.T, sb integration.Sandbox) {
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	def, err := sourceTestState().Marshal(sb.Context())
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:   ExporterTar,
+				Output: fixedWriteCloser(&iohelper.NopWriteCloser{Writer: &buf}),
+				Attrs:  map[string]string{"src": "/sub"},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	m, err := testutil.ReadTarToMap(buf.Bytes(), false)
+	require.NoError(t, err)
+
+	item, ok := m["nested.txt"]
+	require.True(t, ok, "src contents must be at the root of the tarball")
+	require.Equal(t, []byte("nested"), item.Data)
+
+	_, ok = m["deeper/deep.txt"]
+	require.True(t, ok)
+
+	_, ok = m["top.txt"]
+	require.False(t, ok, "paths outside src must not be in the tarball")
 }

@@ -36,7 +36,11 @@ env:
 
 jobs:
   create:
+    if: ${{ github.repository == 'moby/buildkit' }}
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read # same as global permission
+      id-token: write # for logging in to Docker Hub with GitHub OIDC
     strategy:
       fail-fast: false
       matrix:
@@ -49,17 +53,18 @@ jobs:
     steps:
       -
         name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           version: ${{ env.SETUP_BUILDX_VERSION }}
           buildkitd-flags: --debug
       -
         name: Login to DockerHub
-        if: github.event.inputs.dry-run != 'true'
-        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        if: ${{ !inputs['dry-run'] }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.BUILDKIT_OIDC_CONNECTIONID }}
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: moby
       -
         name: Create
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
