@@ -1,6 +1,7 @@
 package git
 
 import (
+	"net/url"
 	"path"
 	"strings"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/moby/buildkit/source"
 	srctypes "github.com/moby/buildkit/source/types"
 	"github.com/moby/buildkit/util/gitutil"
+	"github.com/moby/buildkit/util/sshutil"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 )
@@ -26,6 +28,7 @@ type GitIdentifier struct {
 	KnownSSHHosts    string
 	SkipSubmodules   bool
 	MTime            string // "checkout" (default) or "commit"
+	Advice           bool
 	FetchByCommit    bool
 
 	// Bundle, when non-empty, instructs the git source to fetch commits from a
@@ -70,6 +73,55 @@ func NewGitIdentifier(remoteURL string) (*GitIdentifier, error) {
 		repo.Subdir = u.Opts.Subdir
 	}
 	return &repo, nil
+}
+
+func validateFullRemoteURL(identifier, remoteURL string) (string, error) {
+	if !gitutil.IsGitTransport(remoteURL) {
+		remoteURL = "https://" + remoteURL
+	}
+	remote, err := gitutil.ParseURL(remoteURL)
+	if err != nil {
+		return "", errors.New("failed to parse git.fullurl")
+	}
+
+	if !gitutil.IsGitTransport(identifier) {
+		identifier = "https://" + identifier
+	}
+	id, err := gitutil.ParseURL(identifier)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse Git source identifier")
+	}
+
+	if !strings.EqualFold(id.Host, remote.Host) || gitRepositoryPath(id.Path) != gitRepositoryPath(remote.Path) {
+		return "", errors.New("git.fullurl does not match source identifier")
+	}
+	return normalizeGitRemote(remote, id.Path), nil
+}
+
+func gitRepositoryPath(p string) string {
+	// Match the canonicalization used when llb.Git creates the identifier.
+	return strings.TrimSuffix(path.Join("/", p), ".git")
+}
+
+func normalizeGitRemote(remote *gitutil.GitURL, repositoryPath string) string {
+	repositoryPath = path.Join("/", repositoryPath)
+	if !strings.HasPrefix(strings.ToLower(remote.Remote), remote.Scheme+"://") {
+		if !strings.HasPrefix(remote.Path, "/") {
+			repositoryPath = strings.TrimPrefix(repositoryPath, "/")
+		}
+		return (&sshutil.SCPStyleURL{
+			User: remote.User,
+			Host: remote.Host,
+			Path: repositoryPath,
+		}).String()
+	}
+
+	return (&url.URL{
+		Scheme: remote.Scheme,
+		User:   remote.User,
+		Host:   remote.Host,
+		Path:   repositoryPath,
+	}).String()
 }
 
 func (id *GitIdentifier) String() string {
@@ -136,7 +188,7 @@ func validateBundleAttrs(id *GitIdentifier) error {
 			return err
 		}
 		if id.Checksum == "" {
-			return errors.Errorf("git.bundle requires git.checksum to be set")
+			return errors.New("git.bundle requires git.checksum to be set")
 		}
 		// Reject the pathological "Ref=sha1, Checksum=sha2" case: if both
 		// are set and Ref is itself a commit SHA, the two must agree.
@@ -148,10 +200,10 @@ func validateBundleAttrs(id *GitIdentifier) error {
 	}
 	if id.CheckoutBundle {
 		if id.KeepGitDir {
-			return errors.Errorf("git.checkoutbundle is incompatible with git.keepgitdir")
+			return errors.New("git.checkoutbundle is incompatible with git.keepgitdir")
 		}
 		if id.Subdir != "" {
-			return errors.Errorf("git.checkoutbundle is incompatible with git.subdir")
+			return errors.New("git.checkoutbundle is incompatible with git.subdir")
 		}
 	}
 	return nil

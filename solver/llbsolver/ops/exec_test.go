@@ -10,10 +10,13 @@ import (
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/network"
+	"github.com/moby/buildkit/worker"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
+	"tags.cncf.io/container-device-interface/pkg/cdi"
 )
 
 func TestDedupePaths(t *testing.T) {
@@ -134,7 +137,7 @@ func TestExecOpCacheMap(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -154,6 +157,34 @@ func TestExecOpCacheMap(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExecOpCacheMapRejectsOnDemandCDIWithoutInputs(t *testing.T) {
+	const kind = "buildkit.test/on-demand-device"
+	cdidevices.Register(kind, cacheMapCDISetup{})
+	cache, err := cdi.NewCache(cdi.WithSpecDirs(t.TempDir()))
+	require.NoError(t, err)
+
+	op := newExecOp()
+	op.op.CdiDevices = []*pb.CDIDevice{{Name: kind}}
+	op.w = &cacheMapCDIWorker{cdi: cdidevices.NewManager(cache, nil)}
+
+	_, _, err = op.CacheMap(t.Context(), testJobContext(t), 0)
+	require.EqualError(t, err, `cannot set up CDI device "buildkit.test/on-demand-device" without an input`)
+}
+
+type cacheMapCDISetup struct{}
+
+func (cacheMapCDISetup) Validate() error           { return nil }
+func (cacheMapCDISetup) Run(context.Context) error { return nil }
+
+type cacheMapCDIWorker struct {
+	worker.Worker
+	cdi *cdidevices.Manager
+}
+
+func (w *cacheMapCDIWorker) CDIManager() *cdidevices.Manager {
+	return w.cdi
 }
 
 func TestExecOpContentCache(t *testing.T) {
@@ -218,7 +249,7 @@ func TestExecOpContentCache(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

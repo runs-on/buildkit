@@ -22,6 +22,7 @@ import (
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/platforms"
+	"github.com/google/go-cmp/cmp"
 	intoto "github.com/in-toto/in-toto-golang/in_toto"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/client/llb/sourceresolver"
@@ -39,7 +40,6 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/pmezard/go-difflib/difflib"
 	"github.com/stretchr/testify/require"
 )
 
@@ -358,7 +358,7 @@ func createCompatibilityBaseImage(ctx context.Context, t *testing.T, c *Client, 
 	}, nil)
 	require.NoError(t, err)
 
-	desc, provider, err := contentutil.ProviderFromRef(baseRef)
+	desc, provider, err := contentutil.ProviderFromRef(ctx, baseRef)
 	require.NoError(t, err)
 	actual := readCompatibilityActualFromProvider(ctx, t, provider, desc)
 
@@ -452,7 +452,7 @@ func exportCompatibilityImageCase(ctx context.Context, t *testing.T, c *Client, 
 		return compatibilityActual{}, err
 	}
 
-	desc, provider, err := contentutil.ProviderFromRef(target)
+	desc, provider, err := contentutil.ProviderFromRef(ctx, target)
 	if err != nil {
 		return compatibilityActual{}, err
 	}
@@ -655,7 +655,7 @@ func readCompatibilityActualFromProvider(ctx context.Context, t *testing.T, prov
 }
 
 func readImageCompatibilityProvenance(ctx context.Context, ref string) (*provenancetypes.ProvenancePredicateSLSA1, error) {
-	desc, provider, err := contentutil.ProviderFromRef(ref)
+	desc, provider, err := contentutil.ProviderFromRef(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -731,14 +731,8 @@ func assertCompatibilityCase(t *testing.T, exporterType string, tc compatibility
 	exp, err := compatibilityExpectationFromGoldens(expectedManifestJSON, expectedConfigJSON)
 	require.NoError(t, err)
 
-	manifestDiff := ""
-	if normalizeJSON(expectedManifestJSON) != actual.ManifestJSON {
-		manifestDiff = unifiedDiff("golden-manifest", normalizeJSON(expectedManifestJSON), actual.ManifestJSON)
-	}
-	configDiff := ""
-	if normalizeJSON(expectedConfigJSON) != actual.ConfigJSON {
-		configDiff = unifiedDiff("golden-config", normalizeJSON(expectedConfigJSON), actual.ConfigJSON)
-	}
+	manifestDiff := cmp.Diff(normalizeJSON(expectedManifestJSON), actual.ManifestJSON)
+	configDiff := cmp.Diff(normalizeJSON(expectedConfigJSON), actual.ConfigJSON)
 
 	if exp.ManifestDigest != actual.ManifestDigest ||
 		exp.ConfigDigest != actual.ConfigDigest ||
@@ -868,11 +862,11 @@ func removeGoldenFileIfExists(t *testing.T, path string) {
 
 func formatCompatibilityDebug(exporterType, caseName string, version int, attrs map[string]string, exp compatibilityActual, actual compatibilityActual, manifestDiff, configDiff string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "compatibility regression mismatch\n")
+	fmt.Fprint(&b, "compatibility regression mismatch\n")
 	fmt.Fprintf(&b, "case: %s\n", caseName)
 	fmt.Fprintf(&b, "exporter: %s\n", exporterType)
 	fmt.Fprintf(&b, "compatibility-version: %d\n", version)
-	fmt.Fprintf(&b, "attrs:\n")
+	fmt.Fprint(&b, "attrs:\n")
 
 	keys := make([]string, 0, len(attrs))
 	for k := range attrs {
@@ -883,14 +877,14 @@ func formatCompatibilityDebug(exporterType, caseName string, version int, attrs 
 		fmt.Fprintf(&b, "  %s=%s\n", k, attrs[k])
 	}
 
-	fmt.Fprintf(&b, "\nexpected:\n")
+	fmt.Fprint(&b, "\nexpected:\n")
 	fmt.Fprintf(&b, "  manifest=%s\n", exp.ManifestDigest)
 	fmt.Fprintf(&b, "  config=%s\n", exp.ConfigDigest)
 	for i, layer := range exp.Layers {
 		fmt.Fprintf(&b, "  layer[%d]=%s %s\n", i, layer.MediaType, layer.Digest)
 	}
 
-	fmt.Fprintf(&b, "\nactual:\n")
+	fmt.Fprint(&b, "\nactual:\n")
 	fmt.Fprintf(&b, "  manifest=%s\n", actual.ManifestDigest)
 	fmt.Fprintf(&b, "  config=%s\n", actual.ConfigDigest)
 	for i, layer := range actual.Layers {
@@ -907,20 +901,6 @@ func formatCompatibilityDebug(exporterType, caseName string, version int, attrs 
 	fmt.Fprintf(&b, "\nmanifest json:\n%s\n", actual.ManifestJSON)
 	fmt.Fprintf(&b, "\nconfig json:\n%s\n", actual.ConfigJSON)
 	return b.String()
-}
-
-func unifiedDiff(name, expected, actual string) string {
-	diff, err := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
-		A:        difflib.SplitLines(expected),
-		B:        difflib.SplitLines(actual),
-		FromFile: name + ".golden",
-		ToFile:   name + ".actual",
-		Context:  3,
-	})
-	if err != nil {
-		return fmt.Sprintf("failed to render diff: %v", err)
-	}
-	return diff
 }
 
 func normalizeJSON(dt []byte) string {
