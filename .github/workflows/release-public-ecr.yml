@@ -207,4 +207,3 @@ jobs:
               echo "${moving}: stays on ${current}"
             fi
           done
-
