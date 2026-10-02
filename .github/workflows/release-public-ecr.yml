@@ -27,6 +27,10 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      final: ${{ steps.release.outputs.final }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Validate release tag
         id: release
@@ -39,6 +43,12 @@ jobs:
             exit 1
           fi
           echo "tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+          # Only final releases move the stable tags; release candidates don't.
+          if [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-runs-on\.[0-9]+$ ]]; then
+            echo "final=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "final=false" >> "${GITHUB_OUTPUT}"
+          fi
 
       - name: Checkout release
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -65,6 +75,7 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Build and publish
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -77,3 +88,122 @@ jobs:
           cache-to: type=gha,mode=max,scope=buildkit-release
           provenance: mode=max
           sbom: true
+
+  # Check the published image on both architectures before any stable tag
+  # points at it: buildkitd reports the upstream version, and a mode=max cache
+  # exported by one builder is imported and exported again by a fresh one.
+  smoke:
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - name: Smoke test the published image
+        env:
+          IMAGE: public.ecr.aws/c5h5o9k1/runs-on/buildkit@${{ needs.publish.outputs.digest }}
+          RELEASE_TAG: ${{ needs.publish.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          upstream_version="${RELEASE_TAG%-runs-on.*}"
+          version="$(docker run --rm --entrypoint buildkitd "${IMAGE}" --version)"
+          echo "${version}"
+          if [[ " ${version} " != *" ${upstream_version}"* ]]; then
+            echo "buildkitd reports '${version}', expected ${upstream_version}" >&2
+            exit 1
+          fi
+
+          context="${RUNNER_TEMP}/smoke"
+          mkdir -p "${context}"
+          printf 'FROM busybox:1.36\nRUN echo one > /one\nRUN echo two > /two\n' > "${context}/Dockerfile"
+          build() {
+            local name="$1"
+            shift
+            docker buildx create --name "${name}" --driver docker-container \
+              --driver-opt "image=${IMAGE}" --bootstrap
+            docker buildx build --builder "${name}" --progress=plain "$@" "${context}" \
+              2>&1 | tee "${RUNNER_TEMP}/${name}.log"
+            docker buildx rm "${name}"
+          }
+          build seed --cache-to "type=local,dest=${RUNNER_TEMP}/cache-seed,mode=max"
+          build warm --cache-from "type=local,src=${RUNNER_TEMP}/cache-seed" \
+            --cache-to "type=local,dest=${RUNNER_TEMP}/cache-warm,mode=max"
+
+          cached="$(grep -cE '^#[0-9]+ CACHED$' "${RUNNER_TEMP}/warm.log" || true)"
+          if (( cached < 2 )); then
+            echo "The fresh builder did not reuse the imported cache" >&2
+            exit 1
+          fi
+          test -s "${RUNNER_TEMP}/cache-warm/index.json"
+
+  # Move the per-line tag (vX.Y-runs-on) and buildx-stable-1 to this release,
+  # forward only: a later patch release of an older line, or a republished
+  # older tag, never moves them back. Each moving tag records the release it
+  # points to in the org.opencontainers.image.version index annotation.
+  promote:
+    needs: [publish, smoke]
+    if: needs.publish.outputs.final == 'true'
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: buildkit-public-ecr-moving-tags
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::966509368716:role/RunsOnGithubReleaseRole
+          role-session-name: buildkit-promote-${{ github.run_id }}
+          aws-region: us-east-1
+
+      - name: Log in to Amazon ECR Public
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2.1.6
+        with:
+          registry-type: public
+
+      - name: Move stable tags forward
+        env:
+          REPOSITORY: public.ecr.aws/c5h5o9k1/runs-on/buildkit
+          RELEASE_TAG: ${{ needs.publish.outputs.tag }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          # Prints the release a moving tag points to, or nothing if the tag
+          # doesn't exist yet.
+          current_release() {
+            local out
+            if ! out="$(docker buildx imagetools inspect "${REPOSITORY}:$1" \
+              --format '{{json .Manifest.Annotations}}' 2>&1)"; then
+              if grep -qiE 'not found|manifest unknown' <<<"${out}"; then
+                return 0
+              fi
+              echo "${out}" >&2
+              return 1
+            fi
+            jq -r '.["org.opencontainers.image.version"] // empty' <<<"${out}"
+          }
+
+          newer_than() {
+            [[ -z "$2" ]] && return 0
+            [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" == "$1" ]]
+          }
+
+          line="$(sed -E 's/^(v[0-9]+\.[0-9]+)\..*$/\1/' <<<"${RELEASE_TAG}")-runs-on"
+          for moving in "${line}" buildx-stable-1; do
+            current="$(current_release "${moving}")"
+            if newer_than "${RELEASE_TAG}" "${current}"; then
+              docker buildx imagetools create \
+                --annotation "index:org.opencontainers.image.version=${RELEASE_TAG}" \
+                --tag "${REPOSITORY}:${moving}" "${REPOSITORY}@${DIGEST}"
+              echo "${moving}: ${current:-new} -> ${RELEASE_TAG}"
+            else
+              echo "${moving}: stays on ${current}"
+            fi
+          done
