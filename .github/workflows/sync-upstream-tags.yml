@@ -48,6 +48,10 @@ jobs:
             if (( created_epoch <= sync_after_epoch )); then
               continue
             fi
+            # Only final releases: release candidates are not published.
+            if [[ ! "${upstream_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              continue
+            fi
             runs_on_tag="${upstream_tag}-runs-on.1"
             if ! git show-ref --verify --quiet "refs/tags/${runs_on_tag}"; then
               missing_tags+=("${upstream_tag}")

@@ -1,0 +1,147 @@
+From 35f73264ab6ca33ff793e49d16b04afda96cbb35 Mon Sep 17 00:00:00 2001
+From: Cyril Rohr <hey@cyrilrohr.com>
+Date: Tue, 29 Sep 2026 12:13:07 +0200
+Subject: [PATCH 1/7] contentutil: move the distribution source annotation
+ helper out of getRemote
+
+getRemote records the image a lazy blob comes from in the
+containerd.io/distribution.source.<host> annotation, which the pusher
+reads to mount the blob from that repository instead of uploading it.
+Move that logic to contentutil.AddSourceAnnotation, next to HasSource,
+which reads the same annotation, so cache marshaling can produce the
+same annotation for imported blobs.
+
+No behavior change.
+
+Signed-off-by: Cyril Rohr <hey@cyrilrohr.com>
+---
+ cache/remote.go                 | 27 +++------------------------
+ util/contentutil/source.go      | 26 ++++++++++++++++++++++++++
+ util/contentutil/source_test.go | 24 ++++++++++++++++++++++++
+ 3 files changed, 53 insertions(+), 24 deletions(-)
+
+diff --git a/cache/remote.go b/cache/remote.go
+index 62f6a207f..bfd7b3ac8 100644
+--- a/cache/remote.go
++++ b/cache/remote.go
+@@ -2,14 +2,10 @@ package cache
+ 
+ import (
+ 	"context"
+-	"fmt"
+ 	"maps"
+-	"net/url"
+ 	"slices"
+-	"strings"
+ 
+ 	"github.com/containerd/containerd/v2/core/content"
+-	"github.com/containerd/containerd/v2/pkg/reference"
+ 	cerrdefs "github.com/containerd/errdefs"
+ 	"github.com/moby/buildkit/cache/config"
+ 	"github.com/moby/buildkit/session"
+@@ -188,30 +184,13 @@ func (sr *immutableRef) getRemote(ctx context.Context, createIfNeeded bool, refC
+ 		} else if isLazy {
+ 			imageRefs := ref.getImageRefs()
+ 			for _, imageRef := range imageRefs {
+-				refspec, err := reference.Parse(imageRef)
+-				if err != nil {
+-					return nil, err
+-				}
+-
+-				u, err := url.Parse("dummy://" + refspec.Locator)
+-				if err != nil {
+-					return nil, err
+-				}
+-
+-				source, repo := u.Hostname(), strings.TrimPrefix(u.Path, "/")
+ 				if desc.Annotations == nil {
+ 					desc.Annotations = make(map[string]string)
+ 				}
+-				dslKey := fmt.Sprintf("%s.%s", "containerd.io/distribution.source", source)
+-
+-				var existingRepos []string
+-				if existings, ok := desc.Annotations[dslKey]; ok {
+-					existingRepos = strings.Split(existings, ",")
+-				}
+-				if !slices.Contains(existingRepos, repo) {
+-					existingRepos = append(existingRepos, repo)
++				dslKey, err := contentutil.AddSourceAnnotation(desc.Annotations, imageRef)
++				if err != nil {
++					return nil, err
+ 				}
+-				desc.Annotations[dslKey] = strings.Join(existingRepos, ",")
+ 				addAnnotations = append(addAnnotations, dslKey)
+ 			}
+ 		}
+diff --git a/util/contentutil/source.go b/util/contentutil/source.go
+index 4ee563b1e..2259afedf 100644
+--- a/util/contentutil/source.go
++++ b/util/contentutil/source.go
+@@ -9,6 +9,32 @@ import (
+ 	"github.com/containerd/containerd/v2/pkg/reference"
+ )
+ 
++// AddSourceAnnotation records ref as a distribution source of a blob in
++// annotations, under the key that the containerd pusher reads to mount the
++// blob from another repository instead of uploading it. It returns that key.
++func AddSourceAnnotation(annotations map[string]string, ref string) (string, error) {
++	refspec, err := reference.Parse(ref)
++	if err != nil {
++		return "", err
++	}
++	u, err := url.Parse("dummy://" + refspec.Locator)
++	if err != nil {
++		return "", err
++	}
++
++	source, repo := u.Hostname(), strings.TrimPrefix(u.Path, "/")
++	key := "containerd.io/distribution.source." + source
++	var repos []string
++	if existing, ok := annotations[key]; ok {
++		repos = strings.Split(existing, ",")
++	}
++	if !slices.Contains(repos, repo) {
++		repos = append(repos, repo)
++	}
++	annotations[key] = strings.Join(repos, ",")
++	return key, nil
++}
++
+ func HasSource(info content.Info, refspec reference.Spec) (bool, error) {
+ 	u, err := url.Parse("dummy://" + refspec.Locator)
+ 	if err != nil {
+diff --git a/util/contentutil/source_test.go b/util/contentutil/source_test.go
+index b2eb0b0ca..582dd045f 100644
+--- a/util/contentutil/source_test.go
++++ b/util/contentutil/source_test.go
+@@ -55,3 +55,27 @@ func TestHasSource(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.False(t, b)
+ }
++
++func TestAddSourceAnnotation(t *testing.T) {
++	annotations := map[string]string{}
++	key, err := AddSourceAnnotation(annotations, "registry.example.com:5000/cache/app:main")
++	require.NoError(t, err)
++	require.Equal(t, "containerd.io/distribution.source.registry.example.com", key)
++	require.Equal(t, "cache/app", annotations[key])
++
++	_, err = AddSourceAnnotation(annotations, "registry.example.com/cache/other:main")
++	require.NoError(t, err)
++	_, err = AddSourceAnnotation(annotations, "registry.example.com/cache/app:pr")
++	require.NoError(t, err)
++	require.Equal(t, "cache/app,cache/other", annotations[key], "repositories are appended once")
++
++	info := content.Info{Labels: annotations}
++	ref, err := reference.Parse("registry.example.com/cache/other:latest")
++	require.NoError(t, err)
++	b, err := HasSource(info, ref)
++	require.NoError(t, err)
++	require.True(t, b)
++
++	_, err = AddSourceAnnotation(annotations, "")
++	require.Error(t, err)
++}
+-- 
+2.51.0
+

@@ -1,0 +1,374 @@
+From eb844b13c929baec46ee7bc0eb1ae4a0114bfac9 Mon Sep 17 00:00:00 2001
+From: Cyril Rohr <hey@cyrilrohr.com>
+Date: Tue, 29 Sep 2026 12:15:07 +0200
+Subject: [PATCH 3/7] solver: reuse imported cache remotes when exporting
+
+When a remote cache export reaches a record that came from an imported
+cache, ExportTo loads the result into the local cache (FromRemote, then
+GetByBlob with several bolt commits per record) and resolves its remotes
+again. runCacheExporters always sets a compression option, so this
+happens for every imported record, although resolving a remote without
+forced compression keeps the blobs it already has. On warm mode=max
+exports, "preparing build cache for export" grows with the number of
+imported records while no blob changes.
+
+Reuse the imported remote unless the export forces a compression that
+the remote does not have. Forced gzip and eStargz exports still load the
+result: the two share a media type, so only the blob content tells them
+apart. When it loaded the result, ExportTo also recorded the resolved
+remote as a second result for the record; without forced compression it
+has the same blobs, and item.addResult keeps only the first of two results
+with the same creation time and layer count anyway.
+
+Loading the result also turned the registry importer's
+containerd.io/distribution.source.ref annotation into the
+containerd.io/distribution.source.<host> annotation that the pusher
+uses for cross-repository mounts. Do that conversion when marshaling
+the cache instead, so mode=max exports keep the same manifests. mode=min
+exports, which never loaded imported results, now carry that annotation
+too instead of the importer's internal one.
+
+Signed-off-by: Cyril Rohr <hey@cyrilrohr.com>
+---
+ cache/remotecache/v1/utils.go      |  13 ++++
+ cache/remotecache/v1/utils_test.go |  35 +++++++++
+ client/client_cache_test.go        | 113 +++++++++++++++++++++++++++++
+ client/client_test.go              |   1 +
+ solver/exporter.go                 |  31 +++++++-
+ solver/exporter_test.go            |  46 ++++++++++++
+ 6 files changed, 238 insertions(+), 1 deletion(-)
+ create mode 100644 cache/remotecache/v1/utils_test.go
+
+diff --git a/cache/remotecache/v1/utils.go b/cache/remotecache/v1/utils.go
+index 8e004d862..877c4022b 100644
+--- a/cache/remotecache/v1/utils.go
++++ b/cache/remotecache/v1/utils.go
+@@ -4,13 +4,16 @@ import (
+ 	"cmp"
+ 	"context"
+ 	"fmt"
++	"maps"
+ 	"slices"
+ 	"sort"
+ 
+ 	cerrdefs "github.com/containerd/errdefs"
+ 	cacheimporttypes "github.com/moby/buildkit/cache/remotecache/v1/types"
+ 	"github.com/moby/buildkit/solver"
++	"github.com/moby/buildkit/util/bklog"
+ 	"github.com/moby/buildkit/util/compression"
++	"github.com/moby/buildkit/util/contentutil"
+ 	digest "github.com/opencontainers/go-digest"
+ 	"github.com/pkg/errors"
+ )
+@@ -156,6 +159,16 @@ func marshalRemote(ctx context.Context, r *solver.Remote, state *marshalState) s
+ 	if desc.MediaType != "" {
+ 		desc = compression.ConvertAllLayerMediaTypes(ctx, true, desc)[0]
+ 	}
++	if ref, ok := desc.Annotations["containerd.io/distribution.source.ref"]; ok {
++		// The registry importer records the cache ref a blob came from. Export it
++		// as the distribution source annotation that lazy refs carry, so pushing
++		// to another repository can mount the blob instead of uploading it.
++		desc.Annotations = maps.Clone(desc.Annotations)
++		delete(desc.Annotations, "containerd.io/distribution.source.ref")
++		if _, err := contentutil.AddSourceAnnotation(desc.Annotations, ref); err != nil {
++			bklog.G(ctx).WithError(err).Debugf("ignoring invalid cache source reference %q", ref)
++		}
++	}
+ 
+ 	state.descriptors[desc.Digest] = DescriptorProviderPair{
+ 		Descriptor: desc,
+diff --git a/cache/remotecache/v1/utils_test.go b/cache/remotecache/v1/utils_test.go
+new file mode 100644
+index 000000000..ab8a740cb
+--- /dev/null
++++ b/cache/remotecache/v1/utils_test.go
+@@ -0,0 +1,35 @@
++package cacheimport
++
++import (
++	"testing"
++
++	"github.com/moby/buildkit/solver"
++	digest "github.com/opencontainers/go-digest"
++	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
++	"github.com/stretchr/testify/require"
++)
++
++func TestMarshalRemoteConvertsSourceReference(t *testing.T) {
++	dgst := digest.FromString("layer")
++	remote := &solver.Remote{Descriptors: []ocispecs.Descriptor{{
++		Digest:    dgst,
++		MediaType: ocispecs.MediaTypeImageLayerGzip,
++		Annotations: map[string]string{
++			"containerd.io/distribution.source.ref": "registry.example.com/cache/app:main",
++			"containerd.io/uncompressed":            digest.FromString("diff").String(),
++		},
++	}}}
++	state := &marshalState{
++		chainsByID:  map[string]int{},
++		descriptors: DescriptorProvider{},
++	}
++
++	marshalRemote(t.Context(), remote, state)
++
++	desc := state.descriptors[dgst].Descriptor
++	require.NotContains(t, desc.Annotations, "containerd.io/distribution.source.ref")
++	require.Equal(t, "cache/app", desc.Annotations["containerd.io/distribution.source.registry.example.com"])
++	require.Equal(t, digest.FromString("diff").String(), desc.Annotations["containerd.io/uncompressed"])
++	require.Equal(t, "registry.example.com/cache/app:main", remote.Descriptors[0].Annotations["containerd.io/distribution.source.ref"], "input descriptor must not be mutated")
++	require.NotContains(t, remote.Descriptors[0].Annotations, "containerd.io/distribution.source.registry.example.com", "input descriptor must not be mutated")
++}
+diff --git a/client/client_cache_test.go b/client/client_cache_test.go
+index 7ec34307b..3b3dbba49 100644
+--- a/client/client_cache_test.go
++++ b/client/client_cache_test.go
+@@ -757,6 +757,119 @@ func testImageManifestRegistryCacheImportExport(t *testing.T, sb integration.San
+ 	testBasicCacheImportExport(t, sb, []CacheOptionsEntry{im}, []CacheOptionsEntry{ex})
+ }
+ 
++// testRegistryCacheReexportImportedLayers exports a cache imported from a
++// registry. Imported layers that already have the requested compression are
++// exported as they are: their blobs must still be copied, and the importer's
++// source reference must be exported as the distribution source annotation
++// used for cross-repository mounts. Forced compression must still convert
++// every layer.
++func testRegistryCacheReexportImportedLayers(t *testing.T, sb integration.Sandbox) {
++	integration.SkipOnPlatform(t, "windows")
++	workers.CheckFeatureCompat(t, sb,
++		workers.FeatureCacheExport,
++		workers.FeatureCacheImport,
++		workers.FeatureCacheBackendRegistry,
++		workers.FeatureCacheBackendLocal,
++	)
++	registry, err := sb.NewRegistry()
++	if errors.Is(err, integration.ErrRequirements) {
++		t.Skip(err.Error())
++	}
++	require.NoError(t, err)
++
++	c, err := New(sb.Context(), sb.Address())
++	require.NoError(t, err)
++	defer c.Close()
++
++	busybox := llb.Image("busybox:latest")
++	st := llb.Scratch()
++	run := func(cmd string) {
++		st = busybox.Run(llb.Shlex(cmd), llb.Dir("/wd")).AddMount("/wd", st)
++	}
++	run(`sh -c "echo -n foobar > const"`)
++	run(`sh -c "cat /dev/urandom | head -c 100 | sha256sum > unique"`)
++
++	def, err := st.Marshal(sb.Context())
++	require.NoError(t, err)
++
++	solve := func(imports, exports []CacheOptionsEntry) {
++		_, err := c.Solve(sb.Context(), def, SolveOpt{
++			Exports:      []ExportEntry{{Type: ExporterLocal, OutputDir: t.TempDir()}},
++			CacheImports: imports,
++			CacheExports: exports,
++		}, nil)
++		require.NoError(t, err)
++	}
++
++	target := registry + "/buildkit/testreexport:cache"
++	solve(nil, []CacheOptionsEntry{{
++		Type: "registry",
++		Attrs: map[string]string{
++			"ref":            target,
++			"mode":           "max",
++			"oci-mediatypes": "true",
++		},
++	}})
++
++	reexport := func(attrs map[string]string) []ocispecs.Descriptor {
++		ensurePruneAll(t, c, sb)
++		dest := t.TempDir()
++		attrs["dest"] = dest
++		attrs["mode"] = "max"
++		attrs["image-manifest"] = "false"
++		attrs["oci-mediatypes"] = "true"
++		solve(
++			[]CacheOptionsEntry{{Type: "registry", Attrs: map[string]string{"ref": target}}},
++			[]CacheOptionsEntry{{Type: "local", Attrs: attrs}},
++		)
++		return localCacheLayers(t, dest)
++	}
++
++	registryHost, _, _ := strings.Cut(registry, ":")
++	layers := reexport(map[string]string{})
++	require.NotEmpty(t, layers)
++	for _, layer := range layers {
++		require.Equal(t, ocispecs.MediaTypeImageLayerGzip, layer.MediaType)
++		require.NotContains(t, layer.Annotations, "containerd.io/distribution.source.ref")
++		require.Equal(t, "buildkit/testreexport", layer.Annotations["containerd.io/distribution.source."+registryHost])
++	}
++
++	layers = reexport(map[string]string{
++		"compression":       "zstd",
++		"force-compression": "true",
++	})
++	require.NotEmpty(t, layers)
++	for _, layer := range layers {
++		require.Equal(t, ocispecs.MediaTypeImageLayerZstd, layer.MediaType)
++	}
++}
++
++// localCacheLayers returns the layer descriptors of a local cache export and
++// checks that every layer blob was written.
++func localCacheLayers(t *testing.T, dest string) []ocispecs.Descriptor {
++	var index ocispecs.Index
++	dt, err := os.ReadFile(filepath.Join(dest, ocispecs.ImageIndexFile))
++	require.NoError(t, err)
++	require.NoError(t, json.Unmarshal(dt, &index))
++	require.Len(t, index.Manifests, 1)
++
++	var cacheList ocispecs.Index
++	dt, err = os.ReadFile(filepath.Join(dest, ocispecs.ImageBlobsDir, "sha256", index.Manifests[0].Digest.Hex()))
++	require.NoError(t, err)
++	require.NoError(t, json.Unmarshal(dt, &cacheList))
++
++	var layers []ocispecs.Descriptor
++	for _, desc := range cacheList.Manifests {
++		if !images.IsLayerType(desc.MediaType) {
++			continue
++		}
++		_, err := os.Stat(filepath.Join(dest, ocispecs.ImageBlobsDir, "sha256", desc.Digest.Hex()))
++		require.NoError(t, err, "missing blob for layer %s", desc.Digest)
++		layers = append(layers, desc)
++	}
++	return layers
++}
++
+ func testLocalCacheExportReset(t *testing.T, sb integration.Sandbox) {
+ 	integration.SkipOnPlatform(t, "windows")
+ 	workers.CheckFeatureCompat(t, sb, workers.FeatureCacheExport, workers.FeatureCacheBackendLocal)
+diff --git a/client/client_test.go b/client/client_test.go
+index 7407d0254..cf16a743a 100644
+--- a/client/client_test.go
++++ b/client/client_test.go
+@@ -33,6 +33,7 @@ var allTests = []func(t *testing.T, sb integration.Sandbox){
+ 	testRemoteCacheSharedMergeBranches,
+ 	testMultipleRegistryCacheImportExport,
+ 	testRegistryCacheImportSessionRebind,
++	testRegistryCacheReexportImportedLayers,
+ 	testRegistryEmptyCacheExport,
+ 	testSnapshotWithMultipleBlobs,
+ 	testUncompressedLocalCacheImportExport,
+diff --git a/solver/exporter.go b/solver/exporter.go
+index 6ade2f44c..dbcf4fcf4 100644
+--- a/solver/exporter.go
++++ b/solver/exporter.go
+@@ -6,6 +6,7 @@ import (
+ 	"slices"
+ 
+ 	cerrdefs "github.com/containerd/errdefs"
++	"github.com/moby/buildkit/util/compression"
+ 	digest "github.com/opencontainers/go-digest"
+ )
+ 
+@@ -187,7 +188,7 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
+ 			}
+ 		}
+ 
+-		if (remote == nil || opt.CompressionOpt != nil) && opt.Mode != CacheExportModeRemoteOnly {
++		if needsLocalResult(remote, opt) && opt.Mode != CacheExportModeRemoteOnly {
+ 			res, err := cm.results.Load(ctx, res)
+ 			if err != nil {
+ 				if !errors.Is(err, cerrdefs.ErrNotFound) {
+@@ -312,6 +313,34 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
+ 	return res[e], nil
+ }
+ 
++// needsLocalResult reports whether ExportTo must resolve a record's remote
++// from its local result rather than export the remote it already has.
++// Loading a result materializes it in the local cache, which is costly for
++// every imported record of a mode=max export. Resolving only changes the blobs
++// of an existing remote when compression is forced and a layer doesn't have it
++// yet (see getRemote), so it is needed when there is no remote or for that
++// conversion.
++func needsLocalResult(remote *Remote, opt CacheExportOpt) bool {
++	if remote == nil {
++		return true
++	}
++	comp := opt.CompressionOpt
++	if comp == nil || !comp.Force {
++		return false
++	}
++	// eStargz and gzip layers share a media type, so only their content tells
++	// them apart: a forced conversion between them always resolves.
++	if comp.Type == compression.Gzip || comp.Type == compression.EStargz {
++		return true
++	}
++	for _, desc := range remote.Descriptors {
++		if !compression.IsMediaType(comp.Type, desc.MediaType) {
++			return true
++		}
++	}
++	return false
++}
++
+ func getBestResult(records []*CacheRecord) *CacheRecord {
+ 	records = slices.Clone(records)
+ 	slices.SortStableFunc(records, compareCacheRecord)
+diff --git a/solver/exporter_test.go b/solver/exporter_test.go
+index 3534e41fa..28fdaa269 100644
+--- a/solver/exporter_test.go
++++ b/solver/exporter_test.go
+@@ -4,8 +4,54 @@ import (
+ 	"slices"
+ 	"testing"
+ 	"time"
++
++	"github.com/moby/buildkit/util/compression"
++	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
++	"github.com/stretchr/testify/require"
+ )
+ 
++func TestNeedsLocalResult(t *testing.T) {
++	gzipLayers := &Remote{Descriptors: []ocispecs.Descriptor{
++		{MediaType: ocispecs.MediaTypeImageLayerGzip},
++		{MediaType: ocispecs.MediaTypeImageLayerGzip},
++	}}
++	zstdLayers := &Remote{Descriptors: []ocispecs.Descriptor{
++		{MediaType: ocispecs.MediaTypeImageLayerZstd},
++	}}
++	// e.g. zstd layers built on top of a gzip base image.
++	mixedLayers := &Remote{Descriptors: []ocispecs.Descriptor{
++		{MediaType: ocispecs.MediaTypeImageLayerGzip},
++		{MediaType: ocispecs.MediaTypeImageLayerZstd},
++	}}
++	withCompression := func(c compression.Config) CacheExportOpt {
++		return CacheExportOpt{CompressionOpt: &c}
++	}
++
++	tests := []struct {
++		name   string
++		remote *Remote
++		opt    CacheExportOpt
++		needed bool
++	}{
++		{name: "no remote", opt: withCompression(compression.New(compression.Gzip)), needed: true},
++		{name: "no compression option", remote: gzipLayers},
++		{name: "gzip", remote: gzipLayers, opt: withCompression(compression.New(compression.Gzip))},
++		{name: "zstd requested for gzip layers", remote: gzipLayers, opt: withCompression(compression.New(compression.Zstd))},
++		{name: "zstd requested for mixed layers", remote: mixedLayers, opt: withCompression(compression.New(compression.Zstd))},
++		{name: "forced zstd for zstd layers", remote: zstdLayers, opt: withCompression(compression.New(compression.Zstd).SetForce(true))},
++		{name: "forced zstd for gzip layers", remote: gzipLayers, opt: withCompression(compression.New(compression.Zstd).SetForce(true)), needed: true},
++		{name: "forced zstd for mixed layers", remote: mixedLayers, opt: withCompression(compression.New(compression.Zstd).SetForce(true)), needed: true},
++		{name: "forced gzip", remote: gzipLayers, opt: withCompression(compression.New(compression.Gzip).SetForce(true)), needed: true},
++		{name: "forced estargz", remote: gzipLayers, opt: withCompression(compression.New(compression.EStargz).SetForce(true)), needed: true},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			require.Equal(t, tt.needed, needsLocalResult(tt.remote, tt.opt))
++		})
++	}
++}
++
+ func TestCompareCacheRecord(t *testing.T) {
+ 	now := time.Now()
+ 	a := &CacheRecord{CreatedAt: now, Priority: 1}
+-- 
+2.51.0
+
