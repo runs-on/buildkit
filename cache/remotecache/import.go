@@ -11,6 +11,7 @@ import (
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/labels"
+	cerrdefs "github.com/containerd/errdefs"
 	v1 "github.com/moby/buildkit/cache/remotecache/v1"
 	cacheimporttypes "github.com/moby/buildkit/cache/remotecache/v1/types"
 	"github.com/moby/buildkit/session"
@@ -38,11 +39,63 @@ type DistributionSourceLabelSetter interface {
 }
 
 func NewImporter(provider content.Provider) Importer {
-	return &contentCacheImporter{provider: provider}
+	ci := &contentCacheImporter{provider: provider}
+	if ip, ok := provider.(content.InfoProvider); ok {
+		ci.info = &layerInfo{provider: ip, results: map[digest.Digest]layerInfoResult{}}
+	}
+	return ci
 }
 
 type contentCacheImporter struct {
 	provider content.Provider
+	// info reports whether imported blobs exist, when the provider can tell.
+	info *layerInfo
+}
+
+// layerProvider returns the provider of an imported layer. When the cache's
+// store can tell whether a blob exists, as the local cache's can, the layer
+// reports it through Info: marshaling a cache then skips layers whose blob
+// is gone from the imported cache instead of failing to copy them.
+func (ci *contentCacheImporter) layerProvider(desc ocispecs.Descriptor) v1.DescriptorProviderPair {
+	pair := v1.DescriptorProviderPair{
+		Descriptor: desc,
+		Provider:   ci.provider,
+	}
+	if ci.info != nil {
+		pair.InfoProvider = ci.info
+	}
+	return pair
+}
+
+// layerInfo asks the cache's store about each blob at most once per import:
+// marshaling a cache checks every layer of every chain, and the local cache's
+// store is a round trip to the client.
+type layerInfo struct {
+	provider content.InfoProvider
+	mu       sync.Mutex
+	results  map[digest.Digest]layerInfoResult
+}
+
+type layerInfoResult struct {
+	info content.Info
+	err  error
+}
+
+func (li *layerInfo) Info(ctx context.Context, dgst digest.Digest) (content.Info, error) {
+	li.mu.Lock()
+	r, ok := li.results[dgst]
+	li.mu.Unlock()
+	if ok {
+		return r.info, r.err
+	}
+	info, err := li.provider.Info(ctx, dgst)
+	// Remember whether the blob exists, not failed requests.
+	if err == nil || cerrdefs.IsNotFound(err) {
+		li.mu.Lock()
+		li.results[dgst] = layerInfoResult{info: info, err: err}
+		li.mu.Unlock()
+	}
+	return info, err
 }
 
 func (ci *contentCacheImporter) Resolve(ctx context.Context, desc ocispecs.Descriptor, id string, w worker.Worker) (solver.CacheManager, error) {
@@ -74,10 +127,7 @@ func (ci *contentCacheImporter) Resolve(ctx context.Context, desc ocispecs.Descr
 				configDesc = m
 				continue
 			}
-			allLayers[m.Digest] = v1.DescriptorProviderPair{
-				Descriptor: m,
-				Provider:   ci.provider,
-			}
+			allLayers[m.Digest] = ci.layerProvider(m)
 		}
 	case images.MediaTypeDockerSchema2Manifest, ocispecs.MediaTypeImageManifest:
 		var mfst ocispecs.Manifest
@@ -89,10 +139,7 @@ func (ci *contentCacheImporter) Resolve(ctx context.Context, desc ocispecs.Descr
 			configDesc = mfst.Config
 		}
 		for _, m := range mfst.Layers {
-			allLayers[m.Digest] = v1.DescriptorProviderPair{
-				Descriptor: m,
-				Provider:   ci.provider,
-			}
+			allLayers[m.Digest] = ci.layerProvider(m)
 		}
 	default:
 		err = errors.Wrapf(err, "unsupported or uninferrable manifest type")
@@ -224,10 +271,7 @@ func (ci *contentCacheImporter) importInlineCache(ctx context.Context, dt []byte
 						m.Annotations["buildkit/description"] = createdBy
 					}
 					m.Annotations[labels.LabelUncompressed] = img.Rootfs.DiffIDs[i].String()
-					layers[m.Digest] = v1.DescriptorProviderPair{
-						Descriptor: m,
-						Provider:   ci.provider,
-					}
+					layers[m.Digest] = ci.layerProvider(m)
 					config.Layers = append(config.Layers, cacheimporttypes.CacheLayer{
 						Blob:        m.Digest,
 						ParentIndex: i - 1,
