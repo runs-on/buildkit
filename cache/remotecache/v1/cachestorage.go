@@ -5,9 +5,11 @@ import (
 	"slices"
 	"time"
 
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/util/compression"
+	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
@@ -311,15 +313,20 @@ func (cs *cacheResultStorage) Load(ctx context.Context, res solver.CacheResult) 
 	return nil, errors.WithStack(solver.ErrNotFound)
 }
 
-func (cs *cacheResultStorage) LoadRemotes(ctx context.Context, res solver.CacheResult, compressionopts *compression.Config, _ session.Group) ([]*solver.Remote, error) {
+func (cs *cacheResultStorage) LoadRemotes(ctx context.Context, res solver.CacheResult, compressionopts *compression.Config, g session.Group) ([]*solver.Remote, error) {
 	if it := cs.byResultID(res.ID); it != nil {
+		if compressionopts != nil && compressionopts.Force && (compressionopts.Type == compression.Gzip || compressionopts.Type == compression.EStargz) {
+			// eStargz and gzip layers share a media type, so only their content
+			// tells them apart: let the caller load the result and convert it.
+			return nil, nil
+		}
 		for _, r := range it.results {
 			if compressionopts == nil {
 				resultID := remoteID(r.Result)
 				if resultID != res.ID {
 					continue
 				}
-				return []*solver.Remote{r.Result}, nil
+				return []*solver.Remote{remoteForSession(r.Result, g)}, nil
 			}
 			// Any of blobs in the remote must meet the specified compression option.
 			match := false
@@ -332,12 +339,26 @@ func (cs *cacheResultStorage) LoadRemotes(ctx context.Context, res solver.CacheR
 				}
 			}
 			if match {
-				return []*solver.Remote{r.Result}, nil
+				return []*solver.Remote{remoteForSession(r.Result, g)}, nil
 			}
 		}
 		return nil, nil // return nil as it's best effort.
 	}
 	return nil, errors.WithStack(solver.ErrNotFound)
+}
+
+// remoteForSession returns r with its provider bound to g, so that exporting
+// an imported remote reads its blobs with the exporting build's session (the
+// registry's credentials), as loading the result does.
+func remoteForSession(r *solver.Remote, g session.Group) *solver.Remote {
+	if g == nil || r.Provider == nil {
+		return r
+	}
+	p, ok := contentutil.ProviderForSession(r.Provider, g).(content.InfoReaderProvider)
+	if !ok {
+		return r
+	}
+	return &solver.Remote{Descriptors: r.Descriptors, Provider: p}
 }
 
 func (cs *cacheResultStorage) Exists(ctx context.Context, id string) bool {
