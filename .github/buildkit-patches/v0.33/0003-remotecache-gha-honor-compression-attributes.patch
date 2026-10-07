@@ -1,7 +1,7 @@
-From abc2546b9d8ee0688638988e8e4b45064f3e57da Mon Sep 17 00:00:00 2001
+From bcfe72017fb37458ccb9bb3e21e21e07c78b19d6 Mon Sep 17 00:00:00 2001
 From: Cyril Rohr <hey@cyrilrohr.com>
 Date: Tue, 29 Sep 2026 12:16:36 +0200
-Subject: [PATCH 5/7] remotecache/gha: honor compression attributes
+Subject: [PATCH 3/5] remotecache/gha: honor compression attributes
 
 The gha cache exporter returned a hardcoded compression.New(compression.
 Default) from Config(), so compression, compression-level and

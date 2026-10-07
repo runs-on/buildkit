@@ -1,7 +1,7 @@
-From a5ee1b9e9d84e304c20c3c21cd40bae1741705e0 Mon Sep 17 00:00:00 2001
+From f0903ab8823aac12b38b36c672852f8ae4e42db4 Mon Sep 17 00:00:00 2001
 From: Cyril Rohr <hey@cyrilrohr.com>
 Date: Tue, 29 Sep 2026 12:18:25 +0200
-Subject: [PATCH 6/7] remotecache/gha: upload cache blobs in parallel
+Subject: [PATCH 4/5] remotecache/gha: upload cache blobs in parallel
 
 Finalize checked and uploaded every layer blob one at a time, so with
 many layers, or large ones, the export spends most of its time on
