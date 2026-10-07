@@ -6,6 +6,7 @@ import (
 	"slices"
 
 	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/buildkit/util/compression"
 	digest "github.com/opencontainers/go-digest"
 )
 
@@ -187,7 +188,7 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 			}
 		}
 
-		if (remote == nil || opt.CompressionOpt != nil) && opt.Mode != CacheExportModeRemoteOnly {
+		if needsLocalResult(remote, opt) && opt.Mode != CacheExportModeRemoteOnly {
 			res, err := cm.results.Load(ctx, res)
 			if err != nil {
 				if !errors.Is(err, cerrdefs.ErrNotFound) {
@@ -310,6 +311,34 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 		res[e] = append(res[e], out)
 	}
 	return res[e], nil
+}
+
+// needsLocalResult reports whether ExportTo must resolve a record's remote
+// from its local result rather than export the remote it already has.
+// Loading a result materializes it in the local cache, which is costly for
+// every imported record of a mode=max export. Resolving only changes the blobs
+// of an existing remote when compression is forced and a layer doesn't have it
+// yet (see getRemote), so it is needed when there is no remote or for that
+// conversion.
+func needsLocalResult(remote *Remote, opt CacheExportOpt) bool {
+	if remote == nil {
+		return true
+	}
+	comp := opt.CompressionOpt
+	if comp == nil || !comp.Force {
+		return false
+	}
+	// eStargz and gzip layers share a media type, so only their content tells
+	// them apart: a forced conversion between them always resolves.
+	if comp.Type == compression.Gzip || comp.Type == compression.EStargz {
+		return true
+	}
+	for _, desc := range remote.Descriptors {
+		if !compression.IsMediaType(comp.Type, desc.MediaType) {
+			return true
+		}
+	}
+	return false
 }
 
 func getBestResult(records []*CacheRecord) *CacheRecord {
