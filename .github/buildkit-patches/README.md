@@ -27,8 +27,8 @@ previous line's series to it (`port-patch-set.yml`):
    `v<major>.<minor>` directory. Merging it lets the sync publish the line.
    Otherwise it opens an issue with the conflict or the failed check.
 
-It only ports from the immediately previous line, and skips a line when a pull
-request or an open issue for it already exists, including a pull request that
-adds the directory by hand. Close the issue or delete the `patch-set/<line>`
+It only ports from the immediately previous line. It skips a line while its
+`patch-set/<line>` branch exists, while an issue for it is open, or while an
+open pull request adds its directory by hand. Close the issue or delete the
 branch to retry, or run the workflow by hand with `dry-run` to preview a port.
 
