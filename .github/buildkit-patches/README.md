@@ -2,19 +2,21 @@
 
 Each directory contains the ordered `git format-patch` series for one upstream
 BuildKit release line. The upstream tag synchronization workflow applies the
-matching series with `git am`; any missing patch set or merge conflict fails the
-workflow before a RunsOn tag is created.
+matching series with `git am`; a merge conflict fails the workflow before a
+RunsOn tag is created. Releases of a line without a patch set are skipped with
+a warning on the workflow run.
 
 Upstream tags are kept immutable. A successfully patched upstream tag such as
 `v0.32.0` is published as `v0.32.0-runs-on.1` in Git and in public ECR.
 
 `sync-after-tag` marks the last upstream tag handled when this automation was
-introduced. The workflow considers every subsequently created upstream `v*`
-tag, including patch releases made from older release branches.
+introduced. The workflow considers every subsequently created final upstream
+release tag (`vX.Y.Z`), including patch releases made from older release
+branches. Release candidates are skipped.
 
 When a new upstream release line needs a rebase:
 
 1. Reapply and validate the patch series on the new upstream tag.
 2. Add the resulting format-patch files under a new `v<major>.<minor>` directory.
-3. Rerun the failed synchronization workflow.
+3. Run the synchronization workflow, or wait for its daily run.
 
