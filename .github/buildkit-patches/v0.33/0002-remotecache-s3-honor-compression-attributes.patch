@@ -1,0 +1,491 @@
+From 1936eca2cabe44f1730008c3100fc559bc11cb8d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ernestas=20Luko=C5=A1evi=C4=8Dius?= <ernetas@gmail.com>
+Date: Sat, 5 Sep 2026 16:04:20 +0300
+Subject: [PATCH 2/5] remotecache/s3: honor compression attributes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The s3 cache exporter returned a hardcoded compression.New(compression.
+Default) from Config(), so compression, compression-level and
+force-compression passed to --export-cache type=s3 were silently ignored
+and every layer was always exported as gzip.
+
+That value was never a deliberate choice for this backend. e3f6d7b99
+added Config() to the Exporter interface to make the compression
+selectable, and wired compression.ParseAttributes into the registry and
+local backends while leaving a placeholder returning the default in gha
+and inline. The s3 backend was added two months later in 09c5a7c0e and
+copied that placeholder instead of the registry implementation.
+
+Nothing in the s3 cache format is tied to gzip. Finalize already records
+the real media type of every layer in the cache manifest and the importer
+reads it back, so blobs of any supported compression round-trip.
+
+Parse the attributes in ResolveCacheExporterFunc and return them from
+Config(), the same way the registry and local backends do.
+
+Fixes #3071
+
+Signed-off-by: Ernestas Lukoševičius <ernetas@gmail.com>
+(cherry picked from commit 950c052b3a514d6283090cd8969826be688dd289)
+---
+ README.md                       |   3 +
+ cache/remotecache/s3/s3.go      |  16 ++-
+ cache/remotecache/s3/s3_test.go | 111 ++++++++++++++++
+ client/client_cache_test.go     | 218 +++++++++++++++++++++++++++++---
+ client/client_test.go           |   2 +
+ 5 files changed, 327 insertions(+), 23 deletions(-)
+ create mode 100644 cache/remotecache/s3/s3_test.go
+
+diff --git a/README.md b/README.md
+index f713ceea9..daa3ee399 100644
+--- a/README.md
++++ b/README.md
+@@ -596,6 +596,9 @@ Beware, these configurations must be available at buildkit daemon level, not at
+ * `ignore-error=<false|true>`: specify if error is ignored in case cache export fails (default: `false`)
+ * `touch_refresh=24h`: Instead of being uploaded again when not changed, blobs files will be "touched" on s3 every `touch_refresh`, default is 24h. Due to this, an expiration policy can be set on the S3 bucket to cleanup useless files automatically. Manifests files are systematically rewritten, there is no need to touch them.
+ * `upload_parallelism=4`: This parameter changes the number of layers uploaded to s3 in parallel. Each individual layer is uploaded with 5 threads, using the Upload manager provided by the AWS SDK.
++* `compression=<uncompressed|gzip|estargz|zstd>`: choose compression type for layers newly created and cached, gzip is default value. `estargz` layers are recorded as plain `gzip` layers in the s3 cache manifest (their eStargz annotations are not preserved), so they cannot be lazily pulled from s3
++* `compression-level=<value>`: compression level for gzip, estargz (0-9) and zstd (0-22)
++* `force-compression=true`: forcibly apply `compression` option to all layers
+ * `retry_mode=<standard|adaptive>`: sets the AWS SDK retry mode (default: `standard`). `standard` uses exponential backoff, `adaptive` adds client-side rate limiting. See [AWS retry documentation](https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html).
+ * `retry_max_attempts=<int>`: sets the maximum number of attempts for each S3 request, including the initial request and all retries (default: 3). Must be a positive integer.
+ 
+diff --git a/cache/remotecache/s3/s3.go b/cache/remotecache/s3/s3.go
+index 3868371ea..20a0aaa21 100644
+--- a/cache/remotecache/s3/s3.go
++++ b/cache/remotecache/s3/s3.go
+@@ -208,20 +208,26 @@ func ResolveCacheExporterFunc() remotecache.ResolveCacheExporterFunc {
+ 			return nil, err
+ 		}
+ 
++		compressionConfig, err := compression.ParseAttributes(attrs)
++		if err != nil {
++			return nil, err
++		}
++
+ 		s3Client, err := newS3Client(ctx, config)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		cc := v1.NewCacheChains()
+-		return &exporter{CacheExporterTarget: cc, chains: cc, s3Client: s3Client, config: config}, nil
++		return &exporter{CacheExporterTarget: cc, chains: cc, s3Client: s3Client, config: config, compression: compressionConfig}, nil
+ 	}
+ }
+ 
+ type exporter struct {
+ 	solver.CacheExporterTarget
+-	chains   *v1.CacheChains
+-	s3Client *s3Client
+-	config   Config
++	chains      *v1.CacheChains
++	s3Client    *s3Client
++	config      Config
++	compression compression.Config
+ }
+ 
+ func (*exporter) Name() string {
+@@ -230,7 +236,7 @@ func (*exporter) Name() string {
+ 
+ func (e *exporter) Config() remotecache.Config {
+ 	return remotecache.Config{
+-		Compression: compression.New(compression.Default),
++		Compression: e.compression,
+ 	}
+ }
+ 
+diff --git a/cache/remotecache/s3/s3_test.go b/cache/remotecache/s3/s3_test.go
+new file mode 100644
+index 000000000..38133a746
+--- /dev/null
++++ b/cache/remotecache/s3/s3_test.go
+@@ -0,0 +1,111 @@
++package s3
++
++import (
++	"maps"
++	"path/filepath"
++	"testing"
++
++	"github.com/moby/buildkit/cache/remotecache"
++	"github.com/moby/buildkit/util/compression"
++	"github.com/stretchr/testify/require"
++)
++
++// TestExporterCompressionAttributes checks that the compression attributes
++// passed to --export-cache are reflected in the exporter config instead of
++// always falling back to the default compression, and that invalid values are
++// rejected when the exporter is resolved.
++func TestExporterCompressionAttributes(t *testing.T) {
++	tests := []struct {
++		name    string
++		attrs   map[string]string
++		want    compression.Config
++		wantErr string
++	}{
++		{
++			name:  "default",
++			attrs: map[string]string{},
++			want:  compression.New(compression.Default),
++		},
++		{
++			name:  "gzip",
++			attrs: map[string]string{"compression": "gzip"},
++			want:  compression.New(compression.Gzip),
++		},
++		{
++			name:  "zstd",
++			attrs: map[string]string{"compression": "zstd"},
++			want:  compression.New(compression.Zstd),
++		},
++		{
++			name:  "uncompressed",
++			attrs: map[string]string{"compression": "uncompressed"},
++			want:  compression.New(compression.Uncompressed),
++		},
++		{
++			name:  "estargz",
++			attrs: map[string]string{"compression": "estargz"},
++			want:  compression.New(compression.EStargz),
++		},
++		{
++			name:  "level",
++			attrs: map[string]string{"compression": "zstd", "compression-level": "12"},
++			want:  compression.New(compression.Zstd).SetLevel(12),
++		},
++		{
++			name:  "force",
++			attrs: map[string]string{"compression": "zstd", "force-compression": "true"},
++			want:  compression.New(compression.Zstd).SetForce(true),
++		},
++		{
++			name:  "force without value",
++			attrs: map[string]string{"force-compression": ""},
++			want:  compression.New(compression.Default).SetForce(true),
++		},
++		{
++			name:    "unknown compression type",
++			attrs:   map[string]string{"compression": "lzma"},
++			wantErr: "unsupported compression type lzma",
++		},
++		{
++			name:    "non-integer compression level",
++			attrs:   map[string]string{"compression-level": "fastest"},
++			wantErr: "non-integer value fastest specified for compression-level",
++		},
++		{
++			name:    "non-bool force compression",
++			attrs:   map[string]string{"force-compression": "yes please"},
++			wantErr: "non-bool value yes please specified for force-compression",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			exp, err := resolveTestExporter(t, tt.attrs)
++			if tt.wantErr != "" {
++				require.ErrorContains(t, err, tt.wantErr)
++				return
++			}
++			require.NoError(t, err)
++			require.Equal(t, tt.want, exp.Config().Compression)
++		})
++	}
++}
++
++// resolveTestExporter resolves the s3 exporter for attrs on top of the
++// minimal required ones. Resolving builds a real AWS SDK client whose config
++// loader reads the ambient AWS environment, so point it at nothing: otherwise
++// an AWS_PROFILE or ~/.aws/config on the developer's machine can fail the
++// test for reasons unrelated to the attributes.
++func resolveTestExporter(t *testing.T, attrs map[string]string) (remotecache.Exporter, error) {
++	t.Helper()
++	t.Setenv("AWS_PROFILE", "")
++	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "config"))
++	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "credentials"))
++
++	all := map[string]string{
++		attrBucket: "bucket",
++		attrRegion: "us-east-1",
++	}
++	maps.Copy(all, attrs)
++	return ResolveCacheExporterFunc()(t.Context(), nil, all)
++}
+diff --git a/client/client_cache_test.go b/client/client_cache_test.go
+index 3b3dbba49..5037a25ad 100644
+--- a/client/client_cache_test.go
++++ b/client/client_cache_test.go
+@@ -4,6 +4,8 @@ import (
+ 	"encoding/base64"
+ 	"encoding/json"
+ 	"fmt"
++	"io"
++	"maps"
+ 	"net/http"
+ 	"os"
+ 	"path"
+@@ -14,14 +16,19 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/aws/aws-sdk-go-v2/aws"
++	"github.com/aws/aws-sdk-go-v2/credentials"
++	"github.com/aws/aws-sdk-go-v2/service/s3"
+ 	ctd "github.com/containerd/containerd/v2/client"
+ 	"github.com/containerd/containerd/v2/core/images"
++	ctdcompression "github.com/containerd/containerd/v2/pkg/archive/compression"
+ 	"github.com/containerd/containerd/v2/pkg/namespaces"
+ 	cerrdefs "github.com/containerd/errdefs"
+ 	cacheimporttypes "github.com/moby/buildkit/cache/remotecache/v1/types"
+ 	"github.com/moby/buildkit/client/llb"
+ 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
+ 	"github.com/moby/buildkit/identity"
++	"github.com/moby/buildkit/util/compression"
+ 	"github.com/moby/buildkit/util/testutil"
+ 	"github.com/moby/buildkit/util/testutil/helpers"
+ 	"github.com/moby/buildkit/util/testutil/integration"
+@@ -391,30 +398,205 @@ func testBasicS3CacheImportExport(t *testing.T, sb integration.Sandbox) {
+ 	require.NoError(t, err)
+ 	defer cleanup()
+ 
++	o := CacheOptionsEntry{
++		Type:  "s3",
++		Attrs: s3CacheAttrs(opts, s3Addr, s3Bucket),
++	}
++	testBasicCacheImportExport(t, sb, []CacheOptionsEntry{o}, []CacheOptionsEntry{o})
++	require.NotZero(t, putRequests.Load())
++}
++
++func testZstdS3CacheImportExport(t *testing.T, sb integration.Sandbox) {
++	integration.SkipOnPlatform(t, "windows")
++	workers.CheckFeatureCompat(t, sb,
++		workers.FeatureCacheExport,
++		workers.FeatureCacheImport,
++		workers.FeatureCacheBackendS3,
++	)
++
++	opts := helpers.MinioOpts{
++		Region:          "us-east-1",
++		AccessKeyID:     "minioadmin",
++		SecretAccessKey: "minioadmin",
++	}
++
++	s3Addr, s3Bucket, cleanup, err := helpers.NewMinioServer(t, sb, opts)
++	require.NoError(t, err)
++	defer cleanup()
++
++	// the key layout is set explicitly so that the objects can be read back
++	// below from the same attributes the daemon was given
++	attrs := s3CacheAttrs(opts, s3Addr, s3Bucket)
++	attrs["prefix"] = "cache/"
++	attrs["manifests_prefix"] = "manifests/"
++	attrs["blobs_prefix"] = "blobs/"
++	attrs["name"] = "zstd"
++
++	exAttrs := maps.Clone(attrs)
++	exAttrs["compression"] = "zstd"
++	exAttrs["force-compression"] = "true"
++
+ 	im := CacheOptionsEntry{
+-		Type: "s3",
+-		Attrs: map[string]string{
+-			"region":            opts.Region,
+-			"access_key_id":     opts.AccessKeyID,
+-			"secret_access_key": opts.SecretAccessKey,
+-			"bucket":            s3Bucket,
+-			"endpoint_url":      s3Addr,
+-			"use_path_style":    "true",
+-		},
++		Type:  "s3",
++		Attrs: attrs,
+ 	}
+ 	ex := CacheOptionsEntry{
+-		Type: "s3",
+-		Attrs: map[string]string{
+-			"region":            opts.Region,
+-			"access_key_id":     opts.AccessKeyID,
+-			"secret_access_key": opts.SecretAccessKey,
+-			"bucket":            s3Bucket,
+-			"endpoint_url":      s3Addr,
+-			"use_path_style":    "true",
++		Type:  "s3",
++		Attrs: exAttrs,
++	}
++	testBasicCacheImportExport(t, sb, []CacheOptionsEntry{im}, []CacheOptionsEntry{ex})
++
++	s3c := newS3TestClient(opts, s3Addr)
++
++	// the exported layers must be zstd, otherwise the compression attributes
++	// were ignored and the default was used instead
++	requireS3CacheCompression(t, sb, s3c, exAttrs, compression.Zstd)
++
++	// the build above only creates new layers, which are born in the requested
++	// compression; force-compression must also convert layers that already
++	// exist in another one, so export a result that includes the gzip layers
++	// of the base image under a separate manifest
++	c, err := New(sb.Context(), sb.Address())
++	require.NoError(t, err)
++	defer c.Close()
++
++	st := llb.Image("busybox:latest").Run(llb.Shlex(`sh -c "echo -n zstd > /data"`)).Root()
++	def, err := st.Marshal(sb.Context())
++	require.NoError(t, err)
++
++	forcedAttrs := maps.Clone(exAttrs)
++	forcedAttrs["name"] = "forced"
++	_, err = c.Solve(sb.Context(), def, SolveOpt{
++		CacheExports: []CacheOptionsEntry{
++			{
++				Type:  "s3",
++				Attrs: forcedAttrs,
++			},
+ 		},
++	}, nil)
++	require.NoError(t, err)
++
++	layers := requireS3CacheCompression(t, sb, s3c, forcedAttrs, compression.Zstd)
++	require.Greater(t, len(layers), 1, "expected the base image layers to be exported next to the new one")
++}
++
++func testUncompressedS3CacheImportExport(t *testing.T, sb integration.Sandbox) {
++	integration.SkipOnPlatform(t, "windows")
++	workers.CheckFeatureCompat(t, sb,
++		workers.FeatureCacheExport,
++		workers.FeatureCacheImport,
++		workers.FeatureCacheBackendS3,
++	)
++
++	opts := helpers.MinioOpts{
++		Region:          "us-east-1",
++		AccessKeyID:     "minioadmin",
++		SecretAccessKey: "minioadmin",
++	}
++
++	s3Addr, s3Bucket, cleanup, err := helpers.NewMinioServer(t, sb, opts)
++	require.NoError(t, err)
++	defer cleanup()
++
++	// the key layout is set explicitly so that the objects can be read back
++	// below from the same attributes the daemon was given
++	attrs := s3CacheAttrs(opts, s3Addr, s3Bucket)
++	attrs["prefix"] = "cache/"
++	attrs["manifests_prefix"] = "manifests/"
++	attrs["blobs_prefix"] = "blobs/"
++	attrs["name"] = "uncompressed"
++
++	exAttrs := maps.Clone(attrs)
++	exAttrs["compression"] = "uncompressed"
++	exAttrs["force-compression"] = "true"
++
++	im := CacheOptionsEntry{
++		Type:  "s3",
++		Attrs: attrs,
++	}
++	ex := CacheOptionsEntry{
++		Type:  "s3",
++		Attrs: exAttrs,
+ 	}
+ 	testBasicCacheImportExport(t, sb, []CacheOptionsEntry{im}, []CacheOptionsEntry{ex})
+-	require.NotZero(t, putRequests.Load())
++
++	// uncompressed is the other end of the range: the blob digest equals the
++	// diffID and the media type carries no compression suffix. A silent gzip
++	// fallback would still round-trip above, so what the manifest records is
++	// the only thing that proves the attributes were honored.
++	requireS3CacheCompression(t, sb, newS3TestClient(opts, s3Addr), exAttrs, compression.Uncompressed)
++}
++
++// s3CacheAttrs returns the attributes of an s3 cache import or export entry
++// pointing at the minio server started with opts.
++func s3CacheAttrs(opts helpers.MinioOpts, addr, bucket string) map[string]string {
++	return map[string]string{
++		"region":            opts.Region,
++		"access_key_id":     opts.AccessKeyID,
++		"secret_access_key": opts.SecretAccessKey,
++		"bucket":            bucket,
++		"endpoint_url":      addr,
++		"use_path_style":    "true",
++	}
++}
++
++func newS3TestClient(opts helpers.MinioOpts, addr string) *s3.Client {
++	return s3.NewFromConfig(aws.Config{
++		Region:      opts.Region,
++		Credentials: credentials.NewStaticCredentialsProvider(opts.AccessKeyID, opts.SecretAccessKey, ""),
++	}, func(o *s3.Options) {
++		o.BaseEndpoint = aws.String(addr)
++		o.UsePathStyle = true
++	})
++}
++
++// requireS3CacheCompression reads the cache manifest written by an export with
++// attrs and checks that every layer it references is recorded as comp and that
++// the stored blob really is in that format.
++func requireS3CacheCompression(t *testing.T, sb integration.Sandbox, s3c *s3.Client, attrs map[string]string, comp compression.Type) []cacheimporttypes.CacheLayer {
++	t.Helper()
++
++	var frame ctdcompression.Compression
++	switch comp {
++	case compression.Uncompressed:
++		frame = ctdcompression.Uncompressed
++	case compression.Gzip:
++		frame = ctdcompression.Gzip
++	case compression.Zstd:
++		frame = ctdcompression.Zstd
++	default:
++		t.Fatalf("cannot detect %s blobs", comp)
++	}
++
++	dt := getS3Object(t, sb, s3c, attrs["bucket"], attrs["prefix"]+attrs["manifests_prefix"]+attrs["name"])
++	var config cacheimporttypes.CacheConfig
++	require.NoError(t, json.Unmarshal(dt, &config))
++
++	require.NotEmpty(t, config.Layers)
++	for _, l := range config.Layers {
++		require.NotNil(t, l.Annotations)
++		require.True(t, compression.IsMediaType(comp, l.Annotations.MediaType),
++			"layer %s has media type %q, expected %s", l.Blob, l.Annotations.MediaType, comp)
++
++		blob := getS3Object(t, sb, s3c, attrs["bucket"], attrs["prefix"]+attrs["blobs_prefix"]+l.Blob.String())
++		require.Equal(t, frame, ctdcompression.DetectCompression(blob), "layer %s is not %s", l.Blob, comp)
++	}
++	return config.Layers
++}
++
++func getS3Object(t *testing.T, sb integration.Sandbox, s3c *s3.Client, bucket, key string) []byte {
++	t.Helper()
++
++	out, err := s3c.GetObject(sb.Context(), &s3.GetObjectInput{
++		Bucket: aws.String(bucket),
++		Key:    aws.String(key),
++	})
++	require.NoError(t, err)
++	defer out.Body.Close()
++
++	dt, err := io.ReadAll(out.Body)
++	require.NoError(t, err)
++	return dt
+ }
+ 
+ func testCacheExportCacheDeletedContent(t *testing.T, sb integration.Sandbox) {
+diff --git a/client/client_test.go b/client/client_test.go
+index cf16a743a..565b1eed6 100644
+--- a/client/client_test.go
++++ b/client/client_test.go
+@@ -38,9 +38,11 @@ var allTests = []func(t *testing.T, sb integration.Sandbox){
+ 	testSnapshotWithMultipleBlobs,
+ 	testUncompressedLocalCacheImportExport,
+ 	testUncompressedRegistryCacheImportExport,
++	testUncompressedS3CacheImportExport,
+ 	testZstdLocalCacheExport,
+ 	testZstdLocalCacheImportExport,
+ 	testZstdRegistryCacheImportExport,
++	testZstdS3CacheImportExport,
+ 	testStargzLazyInlineCacheImportExport,
+ 	testStargzLazyRegistryCacheImportExport,
+ 
+-- 
+2.51.0
+
