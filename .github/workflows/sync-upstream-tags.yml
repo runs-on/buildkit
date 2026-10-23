@@ -48,10 +48,22 @@ jobs:
             if (( created_epoch <= sync_after_epoch )); then
               continue
             fi
-            runs_on_tag="${upstream_tag}-runs-on.1"
-            if ! git show-ref --verify --quiet "refs/tags/${runs_on_tag}"; then
-              missing_tags+=("${upstream_tag}")
+            # Only final releases: release candidates are not published.
+            if [[ ! "${upstream_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              continue
             fi
+            runs_on_tag="${upstream_tag}-runs-on.1"
+            if git show-ref --verify --quiet "refs/tags/${runs_on_tag}"; then
+              continue
+            fi
+            # A release line without a patch set is reported instead of
+            # failing every day; adding its patch set picks the tag up.
+            version_line="${upstream_tag%.*}"
+            if [[ ! -d ".github/buildkit-patches/${version_line}" ]]; then
+              echo "::warning title=No RunsOn patch set::${upstream_tag} is not synced: .github/buildkit-patches/${version_line} does not exist"
+              continue
+            fi
+            missing_tags+=("${upstream_tag}")
           done < <(git for-each-ref \
             --sort=creatordate \
             --format='%(creatordate:unix)%09%(refname:strip=2)' \
