@@ -14,9 +14,21 @@ introduced. The workflow considers every subsequently created final upstream
 release tag (`vX.Y.Z`), including patch releases made from older release
 branches. Release candidates are skipped.
 
-When a new upstream release line needs a rebase:
+When upstream starts a new release line, the daily sync tries to port the
+previous line's series to it (`port-patch-set.yml`):
 
-1. Reapply and validate the patch series on the new upstream tag.
-2. Add the resulting format-patch files under a new `v<major>.<minor>` directory.
-3. Run the synchronization workflow, or wait for its daily run.
+1. It applies the series to the line's first release with `git am --3way`,
+   dropping patches upstream already contains: cherry-picks whose original
+   commit is in the release, or patches with no changes left.
+2. It builds the result, runs the unit tests of the patched packages and the
+   cache integration tests, and checks that the series applies to every
+   release of the line.
+3. If everything passes, it opens a pull request adding the
+   `v<major>.<minor>` directory. Merging it lets the sync publish the line.
+   Otherwise it opens an issue with the conflict or the failed check.
+
+It only ports from the immediately previous line, and skips a line when a pull
+request or an open issue for it already exists, including a pull request that
+adds the directory by hand. Close the issue or delete the `patch-set/<line>`
+branch to retry, or run the workflow by hand with `dry-run` to preview a port.
 

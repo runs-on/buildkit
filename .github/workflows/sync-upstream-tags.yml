@@ -5,6 +5,8 @@ on:
     - cron: "23 6 * * *"
   workflow_dispatch:
 
+permissions: {}
+
 concurrency:
   group: sync-upstream-buildkit-tags
   cancel-in-progress: false
@@ -17,6 +19,7 @@ jobs:
     outputs:
       count: ${{ steps.tags.outputs.count }}
       tags: ${{ steps.tags.outputs.tags }}
+      unpatched-lines: ${{ steps.tags.outputs.unpatched-lines }}
     steps:
       - name: Checkout RunsOn BuildKit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -44,6 +47,7 @@ jobs:
           fi
 
           missing_tags=()
+          unpatched_lines=()
           while IFS=$'\t' read -r created_epoch upstream_tag; do
             if (( created_epoch <= sync_after_epoch )); then
               continue
@@ -61,6 +65,7 @@ jobs:
             version_line="${upstream_tag%.*}"
             if [[ ! -d ".github/buildkit-patches/${version_line}" ]]; then
               echo "::warning title=No RunsOn patch set::${upstream_tag} is not synced: .github/buildkit-patches/${version_line} does not exist"
+              unpatched_lines+=("${version_line}")
               continue
             fi
             missing_tags+=("${upstream_tag}")
@@ -74,6 +79,10 @@ jobs:
           echo "count=${#missing_tags[@]}" >> "${GITHUB_OUTPUT}"
           echo "tags=${tags_json}" >> "${GITHUB_OUTPUT}"
           echo "New upstream tags: ${tags_json}"
+          lines_json="$(printf '%s\n' "${unpatched_lines[@]}" | \
+            jq -Rsc 'split("\n") | map(select(length > 0)) | unique')"
+          echo "unpatched-lines=${lines_json}" >> "${GITHUB_OUTPUT}"
+          echo "Release lines without a patch set: ${lines_json}"
 
   sync:
     needs: discover
@@ -88,3 +97,18 @@ jobs:
     uses: ./.github/workflows/sync-upstream-tag.yml
     with:
       upstream-tag: ${{ matrix.upstream-tag }}
+
+  port:
+    needs: discover
+    if: needs.discover.outputs.unpatched-lines != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        version-line: ${{ fromJSON(needs.discover.outputs.unpatched-lines) }}
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    uses: ./.github/workflows/port-patch-set.yml
+    with:
+      version-line: ${{ matrix.version-line }}

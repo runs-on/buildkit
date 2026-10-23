@@ -8,6 +8,8 @@ on:
         required: true
         type: string
 
+permissions: {}
+
 jobs:
   patch:
     runs-on: ubuntu-24.04
