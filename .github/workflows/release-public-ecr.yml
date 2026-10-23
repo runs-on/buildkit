@@ -103,7 +103,22 @@ jobs:
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
+      id-token: write
     steps:
+      # Anonymous pulls from shared GitHub-hosted runner addresses hit ECR
+      # Public's data limit ("toomanyrequests: Data limit exceeded").
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::966509368716:role/RunsOnGithubReleaseRole
+          role-session-name: buildkit-smoke-${{ github.run_id }}
+          aws-region: us-east-1
+
+      - name: Log in to Amazon ECR Public
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2.1.6
+        with:
+          registry-type: public
+
       - name: Smoke test the published image
         env:
           IMAGE: public.ecr.aws/c5h5o9k1/runs-on/buildkit@${{ needs.publish.outputs.digest }}
@@ -121,7 +136,7 @@ jobs:
 
           context="${RUNNER_TEMP}/smoke"
           mkdir -p "${context}"
-          printf 'FROM busybox:1.36\nRUN echo one > /one\nRUN echo two > /two\n' > "${context}/Dockerfile"
+          printf 'FROM public.ecr.aws/docker/library/busybox:1.36\nRUN echo one > /one\nRUN echo two > /two\n' > "${context}/Dockerfile"
           build() {
             local name="$1"
             shift
