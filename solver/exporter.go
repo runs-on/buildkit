@@ -187,20 +187,19 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 			}
 		}
 
-		if (remote == nil || opt.CompressionOpt != nil) && opt.Mode != CacheExportModeRemoteOnly {
+		if remote == nil && opt.Mode != CacheExportModeRemoteOnly {
 			res, err := cm.results.Load(ctx, res)
 			if err != nil {
 				if !errors.Is(err, cerrdefs.ErrNotFound) {
 					return nil, err
 				}
-				remote = nil
 			} else {
 				remotes, err := opt.ResolveRemotes(ctx, res)
 				if err != nil {
 					return nil, err
 				}
 				res.Release(context.TODO())
-				if remote == nil && len(remotes) > 0 {
+				if len(remotes) > 0 {
 					remote, remotes = remotes[0], remotes[1:] // pop the first element
 				}
 				if opt.CompressionOpt != nil {

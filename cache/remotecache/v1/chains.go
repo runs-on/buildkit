@@ -250,11 +250,11 @@ func (p DescriptorProviderPair) ProviderForSession(g session.Group) content.Prov
 }
 
 func (p DescriptorProviderPair) Info(ctx context.Context, dgst digest.Digest) (content.Info, error) {
-	if p.InfoProvider != nil {
-		return p.InfoProvider.Info(ctx, dgst)
-	}
 	if dgst != p.Descriptor.Digest {
 		return content.Info{}, errors.Wrapf(cerrdefs.ErrNotFound, "blob %s", dgst)
+	}
+	if p.InfoProvider != nil {
+		return p.InfoProvider.Info(ctx, dgst)
 	}
 	return content.Info{
 		Digest: p.Descriptor.Digest,
