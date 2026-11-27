@@ -33,6 +33,7 @@ func (s *cacheResultStorage) Save(res solver.Result, createdAt time.Time) (solve
 				return solver.CacheResult{}, err
 			}
 		}
+		enqueueEagerZstdPreparation(ref)
 	}
 	return solver.CacheResult{ID: ref.ID(), CreatedAt: createdAt}, nil
 }
