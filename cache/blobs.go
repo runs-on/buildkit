@@ -34,12 +34,17 @@ import (
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
 var g flightcontrol.Group[*leaseutil.LeaseRef]
 var gFileList flightcontrol.Group[[]string]
 
 var ErrNoBlobs = errors.Errorf("no blobs for snapshot")
+
+const zstdBlobPreparationConcurrency int64 = 2
+
+var zstdBlobPreparationLimiter = semaphore.NewWeighted(zstdBlobPreparationConcurrency)
 
 // computeBlobChain ensures every ref in a parent chain has an associated blob in the content store. If
 // a blob is missing and createIfNeeded is true, then the blob will be created, otherwise ErrNoBlobs will
@@ -104,6 +109,15 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 				}
 				if !createIfNeeded {
 					return nil, errors.WithStack(ErrNoBlobs)
+				}
+				if comp.Type == compression.Zstd {
+					// A zstd writer already uses multiple workers. Limit simultaneous
+					// snapshot walks across all exporter records so cache export does not
+					// oversubscribe CPU and storage bandwidth.
+					if err := zstdBlobPreparationLimiter.Acquire(ctx, 1); err != nil {
+						return nil, err
+					}
+					defer zstdBlobPreparationLimiter.Release(1)
 				}
 
 				l, ctx, err := leaseutil.NewLease(ctx, sr.cm.LeaseManager, leaseutil.MakeTemporary)
